@@ -446,7 +446,9 @@ export class Supervisor {
     if (this.isTerminal()) {
       return { ok: false, code: "terminal", error: `worker is ${this.record.state}` };
     }
-    if (this.record.turnId === undefined) {
+    // Claude can accept the opening turn before its async init supplies an id.
+    // State is the cross-provider signal; Codex also checks its exact turn id.
+    if (this.record.state !== "running" && this.record.state !== "blocked") {
       return { ok: false, code: "bad_request", error: "There is no active turn to cancel; the worker is unchanged." };
     }
     this.interruptRequested = true;

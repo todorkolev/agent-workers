@@ -236,3 +236,13 @@ it("rejects path-like worker ids at every tool and filesystem boundary before pu
   await ensureDirs("valid-purge");await purgeWorker("valid-purge");
   assert.equal(fs.existsSync(workerDir("valid-purge")),false);
 });
+
+
+it("can interrupt Claude's accepted opening turn before async init supplies an id", async () => {
+  await ensureDirs("claude-pre-init");
+  const s=supervisor("claude-pre-init");s.spec.provider="claude";s.record.provider="claude";
+  s.record.state="running";s.record.turnId=undefined;let called=false;
+  s.adapter={interrupt:async()=>{called=true;}};
+  assert.equal((await s.opInterrupt()).ok,true);
+  assert.equal(called,true);assert.equal(s.record.state,"interrupted");
+});
