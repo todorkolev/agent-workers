@@ -26,11 +26,11 @@ import * as readline from "node:readline";
 import { createHash } from "node:crypto";
 import type { WorkerPaths, WorkerRecord } from "./types.ts";
 
-/** Root of all worker state. Override with `AGENTIC_WORKERS_HOME`. */
+/** Root of all worker state. Override with `AGENT_WORKERS_HOME`. */
 export function stateDir(): string {
-  const fromEnv = process.env["AGENTIC_WORKERS_HOME"];
+  const fromEnv = process.env["AGENT_WORKERS_HOME"];
   if (fromEnv && fromEnv.length > 0) return path.resolve(fromEnv);
-  return path.join(os.homedir(), ".agentic-workers");
+  return path.join(os.homedir(), ".agent-workers");
 }
 
 /**
@@ -39,9 +39,9 @@ export function stateDir(): string {
  */
 export function socketDir(): string {
   const runtime = process.env["XDG_RUNTIME_DIR"];
-  const base = runtime && runtime.length > 0 ? path.join(runtime, "agentic-workers") : path.join(stateDir(), "sockets");
+  const base = runtime && runtime.length > 0 ? path.join(runtime, "agent-workers") : path.join(stateDir(), "sockets");
   // Fall back to /tmp if even the base is already too long to hold a socket.
-  return base.length > 80 ? path.join(os.tmpdir(), `agentic-workers-${process.getuid?.() ?? 0}`) : base;
+  return base.length > 80 ? path.join(os.tmpdir(), `agent-workers-${process.getuid?.() ?? 0}`) : base;
 }
 
 /** Absolute path of a worker's directory. */

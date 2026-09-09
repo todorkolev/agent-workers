@@ -2,7 +2,7 @@ node_modules/
 *.tsbuildinfo
 
 # Local worker state, journals and credentials never belong in the repo.
-.agentic-workers/
+.agent-workers/
 .worktrees/
 *.log
 .env

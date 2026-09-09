@@ -12,7 +12,7 @@ export type LogLevel = "debug" | "info" | "warn" | "error";
 const ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
 function envLevel(): LogLevel {
-  const raw = (process.env["AGENTIC_WORKERS_LOG"] ?? "info").toLowerCase();
+  const raw = (process.env["AGENT_WORKERS_LOG"] ?? "info").toLowerCase();
   return raw === "debug" || raw === "info" || raw === "warn" || raw === "error" ? raw : "info";
 }
 

@@ -1,5 +1,5 @@
 /**
- * The shared contract for agentic-workers.
+ * The shared contract for agent-workers.
  *
  * Everything in this file is provider-agnostic and host-agnostic: the same
  * types describe a Claude worker driven from Codex and a Codex worker driven

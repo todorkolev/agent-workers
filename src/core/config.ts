@@ -12,8 +12,8 @@
  * Config is merged from, in increasing precedence:
  *   1. built-in defaults
  *   2. <stateDir>/config.json
- *   3. $AGENTIC_WORKERS_CONFIG (a file path)
- *   4. .agentic-workers.json in the project directory
+ *   3. $AGENT_WORKERS_CONFIG (a file path)
+ *   4. .agent-workers.json in the project directory
  *   5. environment overrides
  */
 
@@ -74,20 +74,20 @@ export async function loadConfig(projectDir?: string): Promise<Config> {
   let cfg = BUILT_IN;
   cfg = merge(cfg, await readJson<Partial<Config>>(path.join(stateDir(), "config.json")));
 
-  const explicit = process.env["AGENTIC_WORKERS_CONFIG"];
+  const explicit = process.env["AGENT_WORKERS_CONFIG"];
   if (explicit && explicit.length > 0) {
     cfg = merge(cfg, await readJson<Partial<Config>>(path.resolve(explicit)));
   }
 
   if (projectDir && projectDir.length > 0) {
-    cfg = merge(cfg, await readJson<Partial<Config>>(path.join(projectDir, ".agentic-workers.json")));
+    cfg = merge(cfg, await readJson<Partial<Config>>(path.join(projectDir, ".agent-workers.json")));
   }
 
-  const envProfile = process.env["AGENTIC_WORKERS_EXEC_PROFILE"];
+  const envProfile = process.env["AGENT_WORKERS_EXEC_PROFILE"];
   if (envProfile && envProfile.length > 0) cfg = { ...cfg, defaultExecProfile: envProfile };
-  if (process.env["AGENTIC_WORKERS_ALLOW_NESTED"] === "1") cfg = { ...cfg, allowNestedWorkers: true };
-  const claudeBin = process.env["AGENTIC_WORKERS_CLAUDE_BIN"];
-  const codexBin = process.env["AGENTIC_WORKERS_CODEX_BIN"];
+  if (process.env["AGENT_WORKERS_ALLOW_NESTED"] === "1") cfg = { ...cfg, allowNestedWorkers: true };
+  const claudeBin = process.env["AGENT_WORKERS_CLAUDE_BIN"];
+  const codexBin = process.env["AGENT_WORKERS_CODEX_BIN"];
   if (claudeBin || codexBin) {
     cfg = { ...cfg, bin: { claude: claudeBin ?? cfg.bin.claude, codex: codexBin ?? cfg.bin.codex } };
   }

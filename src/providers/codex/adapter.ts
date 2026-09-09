@@ -174,7 +174,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
     });
 
     await this.request("initialize", {
-      clientInfo: { name: "agentic-workers", title: "Agentic Workers", version: opts.workerId },
+      clientInfo: { name: "agent-workers", title: "Agent Workers", version: opts.workerId },
       capabilities: null,
     });
   }
@@ -416,7 +416,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
     const kind = APPROVAL_METHODS[method];
 
     if (kind === undefined) {
-      this.write({ id, error: { code: -32601, message: `agentic-workers cannot answer ${method}` } });
+      this.write({ id, error: { code: -32601, message: `agent-workers cannot answer ${method}` } });
       this.emit({
         ts,
         type: "status",

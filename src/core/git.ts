@@ -51,7 +51,7 @@ export type WorktreeRequest = {
   base?: string;
   /** Explicit worktree directory. Defaults to <repo>/.worktrees/aw-<workerId>. */
   dir?: string;
-  /** Explicit branch name. Defaults to agentic/<workerId>. */
+  /** Explicit branch name. Defaults to agent/<workerId>. */
   branch?: string;
 };
 
@@ -68,7 +68,7 @@ export type WorktreeInfo = { path: string; branch: string; base: string; created
  */
 export async function ensureWorktree(req: WorktreeRequest): Promise<WorktreeInfo> {
   const repo = req.repo;
-  const branch = req.branch ?? `agentic/${req.workerId}`;
+  const branch = req.branch ?? `agent/${req.workerId}`;
   const dir = path.resolve(req.dir ?? path.join(repo, ".worktrees", `aw-${req.workerId}`));
   const baseRef = req.base ?? "HEAD";
 
@@ -136,7 +136,7 @@ async function excludeFromRepo(repo: string, worktreeDir: string): Promise<void>
     const prefix = current.length > 0 && !current.endsWith("\n") ? "\n" : "";
     await fs.appendFile(
       excludeFile,
-      `${prefix}# added by agentic-workers: worker worktrees\n${entry}\n`,
+      `${prefix}# added by agent-workers: worker worktrees\n${entry}\n`,
       "utf8",
     );
   } catch {

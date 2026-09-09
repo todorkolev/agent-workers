@@ -441,7 +441,7 @@ export class ClaudeCliAdapter implements ProviderAdapter {
           try {
             this.write({
               type: "control_response",
-              response: { subtype: "error", request_id: id, error: "agentic-workers does not host this control request" },
+              response: { subtype: "error", request_id: id, error: "agent-workers does not host this control request" },
             });
           } catch {
             /* child gone */

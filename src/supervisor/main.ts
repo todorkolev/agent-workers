@@ -32,7 +32,7 @@ async function main(): Promise<void> {
     log.error(`cannot read supervisor spec at ${specPath}`);
     process.exit(2);
   }
-  process.title = `agentic-worker:${spec.workerId}`;
+  process.title = `agent-worker:${spec.workerId}`;
   log.info(`starting ${spec.provider} worker ${spec.workerId} (pid ${process.pid})`);
   await new Supervisor(spec).run();
 }
