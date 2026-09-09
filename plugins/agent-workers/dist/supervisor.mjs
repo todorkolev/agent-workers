@@ -1612,9 +1612,9 @@ var Supervisor = class {
       if (this.record.actualModel === void 0 && prior.actualModel !== void 0) {
         this.record.actualModel = prior.actualModel;
       }
-      this.queued.push(...prior.queued ?? []);
+      if (this.spec.resumeSessionId !== void 0) this.queued.push(...prior.queued ?? []);
       const snapshot = await readJson(this.record.paths.result);
-      if (snapshot !== void 0) {
+      if (snapshot !== void 0 && this.spec.resumeSessionId !== void 0) {
         this.lastFinal = snapshot.final;
         for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
       }
@@ -1630,7 +1630,7 @@ var Supervisor = class {
         return;
       }
       this.writeLock = claim.lock;
-      this.record.startingHead = prior !== void 0 ? prior.startingHead : await resolveCommit(dir, "HEAD");
+      this.record.startingHead = this.spec.resumeSessionId !== void 0 ? prior?.startingHead : await resolveCommit(dir, "HEAD");
     }
     await this.persist();
     this.server = await serveControl(this.record.paths.socket, (req) => this.handleControl(req));
@@ -1776,7 +1776,10 @@ var Supervisor = class {
     }
     const ownershipError = this.checkOwner(request);
     if (ownershipError) return ownershipError;
-    if (request.owner !== void 0) this.record.owner = request.owner;
+    if (request.owner !== void 0) {
+      this.record.owner = request.owner;
+      await this.persist();
+    }
     switch (request.op) {
       case "send":
         return this.opSend(request.text);
@@ -1913,7 +1916,7 @@ var Supervisor = class {
     const ms = this.spec.approvalTimeoutMs;
     if (ms <= 0) return;
     const timer = setTimeout(() => {
-      void (async () => {
+      const timeoutOperation = this.controlChain.then(async () => {
         this.approvalTimers.delete(requestId);
         const index = this.record.pending.findIndex((p) => p.requestId === requestId);
         if (index < 0) return;
@@ -1925,7 +1928,8 @@ var Supervisor = class {
           text: `denied automatically: no manager answered within ${Math.round(ms / 1e3)}s`,
           data: { requestId, auto: true }
         });
-      })();
+      });
+      this.controlChain = timeoutOperation.catch((err) => log3.warn("failed to process approval timeout:", err));
     }, ms);
     timer.unref?.();
     this.approvalTimers.set(requestId, timer);

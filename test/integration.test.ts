@@ -462,6 +462,20 @@ describe("write isolation", () => {
     } finally { await slow.close(); }
   });
 
+  it("starts a fresh attribution baseline when worker_start reuses a stopped ID", async () => {
+    const id="fresh-reuse",dir=path.join(repo,".worktrees","aw-"+id);
+    const args={provider:"codex",workerId:id,cwd:repo,worktree:true,writeAccess:true,task:"first run",waitFor:"idle"};
+    const first=await bridge.call("worker_start",args);assert.equal(first.isError,false,first.text);
+    execFileSync("git",["-C",dir,"commit","--allow-empty","-m","prior-run-commit"],{stdio:"pipe"});
+    const prior=(await bridge.call("worker_result",{workerId:id})).text;
+    assert.match(prior,/prior-run-commit/);
+    await bridge.call("worker_stop",{workerId:id});await sleep(250);
+    const second=await bridge.call("worker_start",{...args,task:"second run"});assert.equal(second.isError,false,second.text);
+    const result=(await bridge.call("worker_result",{workerId:id})).text;
+    assert.doesNotMatch(result,/commit:|prior-run-commit/);
+    await bridge.call("worker_stop",{workerId:id});
+  });
+
   it("adopts a worktree that already exists instead of recreating its branch", async () => {
     const dir = path.join(repo, ".worktrees", "aw-wt-writer");
     // Same worktree, same branch, second worker: this is the case that used to

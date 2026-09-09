@@ -150,3 +150,33 @@ it("observes provider exit even when SIGTERM is ignored", async () => {
   assert.equal(child.signalCode,"SIGKILL");
 });
 
+
+
+it("persists an idle takeover even when no new turn or state change occurs", async () => {
+  await ensureDirs("takeover-idle");
+  const s=supervisor("takeover-idle");s.record.state="idle";
+  const next={host:"claude-code",clientId:"new-manager",since:new Date().toISOString()};
+  const response=await s.handleControl({op:"resume",owner:next,takeover:true});
+  assert.equal(response.ok,true);
+  const saved=JSON.parse(fs.readFileSync(s.record.paths.record,"utf8"));
+  assert.equal(saved.owner.clientId,"new-manager");
+});
+
+it("serializes timeout denial and a concurrent manager answer into one provider response", async () => {
+  await ensureDirs("timeout-race");
+  const s=supervisor("timeout-race");s.record.state="blocked";s.spec.approvalTimeoutMs=10;
+  s.record.pending=[{requestId:"q",kind:"question",text:"choose",ts:new Date().toISOString()}];
+  let release!:()=>void, entered!:()=>void, writes=0;
+  const pending=new Promise<void>(r=>{release=r;});const began=new Promise<void>(r=>{entered=r;});
+  s.adapter={respond:async()=>{writes++;entered();await pending;}};
+  s.armApprovalTimer("q");
+  // Keep the test event loop alive while the production timer is unref'ed.
+  const keepAlive=setTimeout(()=>{},1000);
+  await began;
+  const reply=s.handleControl({op:"respond",requestId:"q",decision:{decision:"answer",text:"late"}});
+  await new Promise(r=>setTimeout(r,10));
+  assert.equal(writes,1);
+  release();assert.equal((await reply).ok,false);
+  assert.equal(s.record.pending.length,0);assert.equal(writes,1);
+  clearTimeout(keepAlive);
+});

@@ -149,9 +149,9 @@ export class Supervisor {
         this.record.actualModel = prior.actualModel;
       }
       // Restore what a manager would otherwise silently lose on recovery.
-      this.queued.push(...(prior.queued ?? []));
+      if (this.spec.resumeSessionId !== undefined) this.queued.push(...(prior.queued ?? []));
       const snapshot = await readJson<WorkerResult>(this.record.paths.result);
-      if (snapshot !== undefined) {
+      if (snapshot !== undefined && this.spec.resumeSessionId !== undefined) {
         this.lastFinal = snapshot.final;
         for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
       }
@@ -174,7 +174,7 @@ export class Supervisor {
         return;
       }
       this.writeLock = claim.lock;
-      this.record.startingHead = prior !== undefined ? prior.startingHead : await resolveCommit(dir, "HEAD");
+      this.record.startingHead = this.spec.resumeSessionId !== undefined ? prior?.startingHead : await resolveCommit(dir, "HEAD");
     }
 
     await this.persist();
@@ -356,7 +356,10 @@ export class Supervisor {
 
     const ownershipError = this.checkOwner(request);
     if (ownershipError) return ownershipError;
-    if (request.owner !== undefined) this.record.owner = request.owner;
+    if (request.owner !== undefined) {
+      this.record.owner = request.owner;
+      await this.persist();
+    }
 
     switch (request.op) {
       case "send":
@@ -502,7 +505,7 @@ export class Supervisor {
     const ms = this.spec.approvalTimeoutMs;
     if (ms <= 0) return;
     const timer = setTimeout(() => {
-      void (async () => {
+      const timeoutOperation = this.controlChain.then(async () => {
         this.approvalTimers.delete(requestId);
         const index = this.record.pending.findIndex((p) => p.requestId === requestId);
         if (index < 0) return;
@@ -514,7 +517,8 @@ export class Supervisor {
           text: `denied automatically: no manager answered within ${Math.round(ms / 1000)}s`,
           data: { requestId, auto: true },
         });
-      })();
+      });
+      this.controlChain = timeoutOperation.catch(err => log.warn("failed to process approval timeout:", err));
     }, ms);
     timer.unref?.();
     this.approvalTimers.set(requestId, timer);
