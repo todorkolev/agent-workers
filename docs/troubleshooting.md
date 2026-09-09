@@ -44,6 +44,21 @@ docker exec -i my-container claude --version
 
 Set `bin` in the profile if the path differs there.
 
+## Codex says "MCP tool call requires approval, but approval policy is never"
+
+Codex asks for approval before every MCP tool call, and a session running with
+approval policy `never` refuses instead of prompting. Add one line to the
+server's block in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.agent-workers]
+default_tools_approval_mode = "approve"
+```
+
+`scripts/install-codex.sh` does this for you. It pre-approves only the `worker_*`
+tools, which start and steer workers rather than touching your files; each
+worker's own sandbox and permission mode still apply.
+
 ## "the codex CLI is not logged in"
 
 ```bash

@@ -85,13 +85,27 @@ git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
 sh ~/src/agent-workers/scripts/install-codex.sh
 ```
 
-Or by hand:
+Or by hand — **both** lines matter:
 
 ```bash
 codex mcp add agent-workers -- node ~/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs
 ```
 
-Either writes an `[mcp_servers.agent-workers]` block into `~/.codex/config.toml`.
+then add one line to the block it wrote in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.agent-workers]
+default_tools_approval_mode = "approve"       # <- add this
+command = "node"
+args = ["/home/you/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs"]
+```
+
+Without it, Codex refuses every `worker_*` call in any session whose approval
+policy is `never` — which is what `codex exec` and most automation use — with
+*"MCP tool call requires approval, but approval policy is never"*. The tools it
+pre-approves start and steer workers; they do not themselves touch your files,
+and each worker's own sandbox and permission mode still apply. Remove the line if
+you would rather approve each call by hand in an interactive session.
 
 Then verify:
 

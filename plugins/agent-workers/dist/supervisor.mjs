@@ -1866,6 +1866,12 @@ var Supervisor = class {
       try {
         await writeJsonAtomic(snapshot.paths.record, snapshot);
       } catch (err) {
+        if (err.code === "ENOENT") {
+          log3.warn("worker directory has been removed; shutting down");
+          this.stopping = true;
+          void this.teardown();
+          return;
+        }
         log3.error("failed to persist worker record:", err);
       }
     });

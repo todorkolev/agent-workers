@@ -539,6 +539,16 @@ export class Supervisor {
       try {
         await writeJsonAtomic(snapshot.paths.record, snapshot);
       } catch (err) {
+        // If the worker's directory is gone, someone purged this worker. There
+        // is nothing left to write to and no manager can reach us any more, so
+        // continuing would leave a provider process running with no way to
+        // observe or stop it.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          log.warn("worker directory has been removed; shutting down");
+          this.stopping = true;
+          void this.teardown();
+          return;
+        }
         log.error("failed to persist worker record:", err);
       }
     });

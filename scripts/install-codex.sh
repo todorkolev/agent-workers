@@ -34,6 +34,24 @@ if codex mcp list 2>/dev/null | grep -q '^agent-workers[[:space:]]'; then
 fi
 
 codex mcp add agent-workers -- node "$bridge"
+
+# Codex asks for approval before every MCP tool call, and a session running with
+# approvalPolicy "never" - which is what `codex exec` and most automation use -
+# refuses them outright rather than prompting: "MCP tool call requires approval,
+# but approval policy is never". Declaring the server's tools as pre-approved is
+# what makes them usable there. These tools start and steer workers; they do not
+# themselves touch your files, and each worker's own sandbox and permission mode
+# still apply.
+codex_config="${CODEX_HOME:-$HOME/.codex}/config.toml"
+if [ -f "$codex_config" ] && ! grep -q 'default_tools_approval_mode' "$codex_config"; then
+  awk '
+    /^\[mcp_servers\.agent-workers\]/ { print; print "default_tools_approval_mode = \"approve\""; next }
+    { print }
+  ' "$codex_config" > "$codex_config.aw-tmp" && mv "$codex_config.aw-tmp" "$codex_config"
+  echo "Set default_tools_approval_mode = \"approve\" for agent-workers."
+  echo "Remove that line if you would rather approve every worker_* call by hand."
+fi
+
 echo
 echo "Registered. Verify with:  codex mcp list"
 echo "The plugin (skills and commands) installs separately:"
