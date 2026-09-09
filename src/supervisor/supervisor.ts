@@ -20,6 +20,7 @@ import {
   appendLine,
   appendText,
   ensureDirs,
+  readRecord,
   workerPaths,
   writeJsonAtomic,
 } from "../core/store.ts";
@@ -95,6 +96,21 @@ export class Supervisor {
 
   async run(): Promise<void> {
     await ensureDirs(this.spec.workerId);
+
+    // Continue an existing worker's history rather than starting a new one on
+    // top of it. The journal is append-only and `seq` is the manager's cursor:
+    // restarting at 0 after a resume would append duplicate sequence numbers,
+    // and every cursor the manager holds would then point at the wrong event.
+    const prior = await readRecord(this.spec.workerId);
+    if (prior !== undefined) {
+      this.seq = prior.lastSeq;
+      this.record.lastSeq = prior.lastSeq;
+      this.record.createdAt = prior.createdAt;
+      if (this.record.actualModel === undefined && prior.actualModel !== undefined) {
+        this.record.actualModel = prior.actualModel;
+      }
+    }
+
     await this.persist();
 
     // The socket goes up FIRST: a manager that polls immediately after

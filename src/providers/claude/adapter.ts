@@ -205,6 +205,11 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       resolveReady = res;
       rejectReady = rej;
     });
+    // The race below may settle on the timer, leaving this promise to reject
+    // with nobody listening. An unhandled rejection would take the supervisor
+    // down, so it is always consumed; the child's exit handler is what actually
+    // reports the failure.
+    promise.catch(() => undefined);
     this.ready = { promise, resolve: resolveReady, reject: rejectReady };
 
     child.on("error", (err) => {

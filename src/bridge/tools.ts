@@ -134,7 +134,17 @@ export const readSchema = {
 export const waitSchema = {
   workerId: z.string(),
   cursor: z.number().int().min(0).optional().describe("Wait for an event after this sequence number."),
-  timeoutMs: z.number().int().min(1000).max(600000).optional().describe("Default 60000."),
+  timeoutMs: z
+    .number()
+    .int()
+    .min(1000)
+    .max(240000)
+    .optional()
+    .describe(
+      "How long to block, default 45000. Kept under a minute by default because a " +
+        "host's own MCP request timeout (often 60s) applies to this call - a longer wait " +
+        "surfaces as a protocol timeout, not as a result. Just call it again to keep waiting.",
+    ),
   until: z
     .enum(["message", "idle", "blocked", "end"])
     .optional()
@@ -492,7 +502,7 @@ export async function workerWait(
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
 
-  const timeoutMs = input.timeoutMs ?? 60_000;
+  const timeoutMs = input.timeoutMs ?? 45_000;
   const until = input.until ?? "message";
   const states =
     until === "idle"
@@ -512,7 +522,7 @@ export async function workerWait(
   const lines = [renderHeader(outcome.worker)];
   lines.push(
     outcome.reason === "timeout"
-      ? `nothing new within ${timeoutMs}ms - the worker is still going`
+      ? `nothing new within ${timeoutMs}ms - the worker is still going; call worker_wait again to keep waiting`
       : `woke on: ${outcome.reason}`,
   );
   lines.push("");

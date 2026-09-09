@@ -185,20 +185,31 @@ export async function summarizeWork(dir: string, base: string | undefined): Prom
   const root = await repoRoot(dir);
   if (root === undefined) return empty;
 
-  // Include untracked files so a brand-new file is never invisible in the diff.
-  await git(dir, ["add", "-AN"]);
-
+  // Everything here is read-only. `git add -AN` would surface untracked files in
+  // the diff, but it writes to the index - an inspection must not change the
+  // state of the repository it is inspecting. Untracked files are listed
+  // separately instead.
   const range = base !== undefined ? [base] : [];
   const nameOnly = await git(dir, ["diff", "--name-only", ...range]);
   const stat = await git(dir, ["diff", "--stat", ...range]);
   const patch = await git(dir, ["diff", ...range]);
+  const untracked = await git(dir, ["ls-files", "--others", "--exclude-standard"]);
 
-  const changedFiles = nameOnly.stdout.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const lines = (out: string): string[] =>
+    out.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const changedFiles = [...new Set([...lines(nameOnly.stdout), ...lines(untracked.stdout)])].sort();
 
+  const newFiles = lines(untracked.stdout);
   const summary: WorkSummary = {
     changedFiles,
     diff: patch.stdout,
-    diffStat: stat.stdout.trim(),
+    // The patch covers tracked changes only, so say when new files exist that it
+    // does not show rather than letting the diff imply they are not there.
+    diffStat:
+      stat.stdout.trim() +
+      (newFiles.length > 0
+        ? `${stat.stdout.trim().length > 0 ? "\n" : ""}${newFiles.length} new untracked file(s): ${newFiles.slice(0, 10).join(", ")}`
+        : ""),
   };
 
   const head = await git(dir, ["log", "-1", "--pretty=%H%x00%s"]);

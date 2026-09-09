@@ -54,6 +54,13 @@ async function writeJsonAtomic(file, value) {
     throw err;
   }
 }
+async function readJson(file) {
+  try {
+    return JSON.parse(await fsp.readFile(file, "utf8"));
+  } catch {
+    return void 0;
+  }
+}
 function readJsonSync(file) {
   try {
     return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -81,6 +88,9 @@ function appendText(file, text) {
 `, "utf8");
   } catch {
   }
+}
+async function readRecord(workerId) {
+  return readJson(workerPaths(workerId).record);
 }
 
 // src/core/logger.ts
@@ -201,16 +211,20 @@ async function summarizeWork(dir, base) {
   const empty = { changedFiles: [], diff: "", diffStat: "" };
   const root = await repoRoot(dir);
   if (root === void 0) return empty;
-  await git(dir, ["add", "-AN"]);
   const range = base !== void 0 ? [base] : [];
   const nameOnly = await git(dir, ["diff", "--name-only", ...range]);
   const stat = await git(dir, ["diff", "--stat", ...range]);
   const patch = await git(dir, ["diff", ...range]);
-  const changedFiles = nameOnly.stdout.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const untracked = await git(dir, ["ls-files", "--others", "--exclude-standard"]);
+  const lines = (out) => out.split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  const changedFiles = [.../* @__PURE__ */ new Set([...lines(nameOnly.stdout), ...lines(untracked.stdout)])].sort();
+  const newFiles = lines(untracked.stdout);
   const summary = {
     changedFiles,
     diff: patch.stdout,
-    diffStat: stat.stdout.trim()
+    // The patch covers tracked changes only, so say when new files exist that it
+    // does not show rather than letting the diff imply they are not there.
+    diffStat: stat.stdout.trim() + (newFiles.length > 0 ? `${stat.stdout.trim().length > 0 ? "\n" : ""}${newFiles.length} new untracked file(s): ${newFiles.slice(0, 10).join(", ")}` : "")
   };
   const head = await git(dir, ["log", "-1", "--pretty=%H%x00%s"]);
   const branchRes = await git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
@@ -343,6 +357,7 @@ var ClaudeCliAdapter = class {
       resolveReady = res;
       rejectReady = rej;
     });
+    promise.catch(() => void 0);
     this.ready = { promise, resolve: resolveReady, reject: rejectReady };
     child.on("error", (err) => {
       const message = `claude CLI failed to start: ${err.message}`;
@@ -1288,6 +1303,15 @@ var Supervisor = class {
   /* ── boot ────────────────────────────────────────────────────────────── */
   async run() {
     await ensureDirs(this.spec.workerId);
+    const prior = await readRecord(this.spec.workerId);
+    if (prior !== void 0) {
+      this.seq = prior.lastSeq;
+      this.record.lastSeq = prior.lastSeq;
+      this.record.createdAt = prior.createdAt;
+      if (this.record.actualModel === void 0 && prior.actualModel !== void 0) {
+        this.record.actualModel = prior.actualModel;
+      }
+    }
     await this.persist();
     this.server = await serveControl(this.record.paths.socket, (req) => this.handleControl(req));
     this.wireAdapter();

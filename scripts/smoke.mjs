@@ -274,10 +274,18 @@ async function scenarioWorktree() {
   if (!workerId) return;
   check("a worktree was created", /worktree: .*branch agent\//.test(started.text), started.text.slice(0, 400));
 
-  const done = await readUntil(workerId, (all) => /NOTE\.md/.test(all) && /(commit|turn success|turn completed)/.test(all), {
-    timeoutMs: 240000,
-  });
+  const done = await readUntil(workerId, (all) => /NOTE\.md/.test(all), { timeoutMs: 240000 });
   check("the worker reported its file work", done.hit, done.all.slice(-600));
+
+  // Collect only once the turn has actually ended - reading a result mid-turn
+  // reports what exists so far, which for a commit is nothing yet.
+  say("waiting for the worker to finish before collecting");
+  let waited = { text: "" };
+  for (let i = 0; i < 8; i += 1) {
+    waited = await call("worker_wait", { workerId, until: "idle", timeoutMs: 30000 });
+    if (/state (idle|completed|interrupted|failed|stopped)/.test(waited.text)) break;
+  }
+  check("worker_wait returned once the worker went idle", /state (idle|completed|interrupted)/.test(waited.text), waited.text.slice(0, 200));
 
   const result = await call("worker_result", { workerId });
   say(result.text.split("\n").slice(0, 8).join("\n"));

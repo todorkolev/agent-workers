@@ -22073,7 +22073,12 @@ function renderEvents(events, mode, maxChars) {
       nextCursor = event.seq;
       continue;
     }
-    const line = renderEvent(event);
+    let line = renderEvent(event);
+    if (line.length > maxChars) {
+      line = `${line.slice(0, maxChars - 60)}
+[... clipped; the full text is in the worker's journal]`;
+      truncated = true;
+    }
     if (used + line.length > maxChars && lines.length > 0) {
       truncated = true;
       break;
@@ -22192,7 +22197,9 @@ var readSchema = {
 var waitSchema = {
   workerId: external_exports.string(),
   cursor: external_exports.number().int().min(0).optional().describe("Wait for an event after this sequence number."),
-  timeoutMs: external_exports.number().int().min(1e3).max(6e5).optional().describe("Default 60000."),
+  timeoutMs: external_exports.number().int().min(1e3).max(24e4).optional().describe(
+    "How long to block, default 45000. Kept under a minute by default because a host's own MCP request timeout (often 60s) applies to this call - a longer wait surfaces as a protocol timeout, not as a result. Just call it again to keep waiting."
+  ),
   until: external_exports.enum(["message", "idle", "blocked", "end"]).optional().describe("What to wait for. Default 'message': any new event, question or state change.")
 };
 var sendSchema = {
@@ -22445,7 +22452,7 @@ async function workerTrace(ctx, input) {
 async function workerWait(_ctx, input) {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
-  const timeoutMs = input.timeoutMs ?? 6e4;
+  const timeoutMs = input.timeoutMs ?? 45e3;
   const until = input.until ?? "message";
   const states = until === "idle" ? ["idle", "blocked", "interrupted", "completed", "failed", "stopped", "orphaned"] : until === "end" ? ["completed", "failed", "stopped", "orphaned"] : ["blocked", "failed", "stopped", "orphaned"];
   const outcome = await waitForWorker(input.workerId, {
@@ -22456,7 +22463,7 @@ async function workerWait(_ctx, input) {
   if (outcome.worker === void 0) return fail(`Worker "${input.workerId}" disappeared while waiting.`);
   const lines = [renderHeader(outcome.worker)];
   lines.push(
-    outcome.reason === "timeout" ? `nothing new within ${timeoutMs}ms - the worker is still going` : `woke on: ${outcome.reason}`
+    outcome.reason === "timeout" ? `nothing new within ${timeoutMs}ms - the worker is still going; call worker_wait again to keep waiting` : `woke on: ${outcome.reason}`
   );
   lines.push("");
   lines.push(renderHint(outcome.worker.record));

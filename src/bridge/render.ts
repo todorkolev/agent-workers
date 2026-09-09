@@ -93,7 +93,13 @@ export function renderEvents(
       nextCursor = event.seq;
       continue;
     }
-    const line = renderEvent(event);
+    let line = renderEvent(event);
+    if (line.length > maxChars) {
+      // One enormous message would otherwise consume the entire budget, or be
+      // returned whole and flood the manager. Clip it and point at the file.
+      line = `${line.slice(0, maxChars - 60)}\n[... clipped; the full text is in the worker's journal]`;
+      truncated = true;
+    }
     if (used + line.length > maxChars && lines.length > 0) {
       truncated = true;
       break;

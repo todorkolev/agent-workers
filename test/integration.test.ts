@@ -243,11 +243,23 @@ for (const provider of ["claude", "codex"] as const) {
       assert.equal(rejected.isError, true);
       assert.match(rejected.text, /worker_resume/);
 
+      const seqBefore = Number(/seq (\d+)/.exec(status.text)?.[1] ?? 0);
       const resumed = await bridge.call("worker_resume", { workerId, task: "RECALL" });
       assert.equal(resumed.isError, false, resumed.text);
       const after = await bridge.call("worker_status", { workerId });
       assert.equal(/provider session: (\S+)/.exec(after.text)?.[1], sessionBefore);
       assert.doesNotMatch(after.text, /NOT RUNNING/);
+
+      // The journal is append-only and seq is the manager's cursor: a resume
+      // that restarted numbering would append duplicate seqs and every cursor
+      // held by a manager would then point at the wrong event.
+      const recalled = await readUntil(bridge, workerId, (all) => /meridian|RESUMED/.test(all), {
+        from: seqBefore,
+      });
+      assert.ok(recalled.hit, `nothing new after the resume:\n${recalled.all}`);
+      const final = await bridge.call("worker_status", { workerId });
+      const seqAfter = Number(/seq (\d+)/.exec(final.text)?.[1] ?? 0);
+      assert.ok(seqAfter > seqBefore, `seq went backwards across a resume: ${seqBefore} -> ${seqAfter}`);
       await bridge.call("worker_stop", { workerId });
     });
   });
