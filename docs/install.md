@@ -60,37 +60,64 @@ be started twice:
 
 ## Codex
 
+Codex takes **two steps**, and both are needed. This is not a preference - it is
+what codex-cli 0.153.4 actually does, verified here:
+
+> Codex discovers a plugin's MCP declaration and lists it in `codex mcp list`,
+> but **does not launch it**. The server never starts and no `worker_*` tools
+> appear. A directly registered MCP server does start and its tools are callable.
+> So the plugin brings the skill and command; the MCP server is registered
+> separately.
+
+**1. The plugin** (skill, command, agent definition):
+
 ```bash
 codex plugin marketplace add todorkolev/agent-workers
 codex plugin add agent-workers@agent-workers
 ```
 
+**2. The MCP server.** Clone the repository somewhere permanent and run the
+installer, which resolves the absolute path for you and refuses to register a
+duplicate:
+
+```bash
+git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
+sh ~/src/agent-workers/scripts/install-codex.sh
+```
+
+Or by hand:
+
+```bash
+codex mcp add agent-workers -- node ~/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs
+```
+
+Either writes an `[mcp_servers.agent-workers]` block into `~/.codex/config.toml`.
+
 Then verify:
 
 ```bash
 codex plugin list | grep agent-workers
-codex mcp list
+codex mcp list | grep agent-workers        # status should be "enabled"
 ```
 
-<details>
-<summary>Manual MCP entry instead of the plugin</summary>
+The definitive check is that a Codex turn can call a tool:
 
 ```bash
-git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
-codex mcp add agent-workers -- node ~/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs
+codex exec 'Call the agent-workers MCP tool worker_list with no filters and report its output.'
 ```
 
-Which writes an `[mcp_servers.agent-workers]` block into `~/.codex/config.toml`.
-Again: pick **one** of the plugin or the manual entry, never both.
-
-</details>
+When a future Codex version launches plugin-declared MCP servers, step 2 becomes
+unnecessary — remove the manual entry then, so the server is not registered
+twice.
 
 ---
 
 ## Do not register the same server twice
 
 Each host must end up with exactly one `agent-workers` MCP server. Two entries
-means two bridge processes.
+means two bridge processes. On Codex today the plugin contributes no running
+server, so the single registration is the manual one; re-check after any Codex
+upgrade that starts launching plugin MCP servers.
 
 Two bridges are not actually dangerous here — workers live in their own
 supervisor processes and every file has a single writer, so a duplicate bridge

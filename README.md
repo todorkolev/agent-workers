@@ -82,15 +82,18 @@ claude
 /plugin install agent-workers@agent-workers
 ```
 
-**Codex**
+**Codex** — two steps, because codex-cli 0.153.4 lists a plugin's MCP server but
+does not launch it:
 
 ```bash
-codex plugin marketplace add todorkolev/agent-workers
+codex plugin marketplace add todorkolev/agent-workers   # skill and command
 codex plugin add agent-workers@agent-workers
+
+git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
+sh ~/src/agent-workers/scripts/install-codex.sh          # the MCP server itself
 ```
 
-Register the MCP server in exactly **one** way per host — the plugin, or a manual
-`codex mcp add` / `.mcp.json` entry, never both.
+Register the MCP server exactly **once** per host.
 
 Requirements: Node 20+, and whichever provider CLIs you intend to use
 (`claude` and/or `codex`), logged in the normal way. Nothing here asks for an API
