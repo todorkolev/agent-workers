@@ -17,12 +17,14 @@
 import type { Server } from "node:net";
 import * as fsp from "node:fs/promises";
 import {
+  acquireWriteLock,
   appendLine,
   appendText,
   ensureDirs,
   readRecord,
   workerPaths,
   writeJsonAtomic,
+  type WriteLock,
 } from "../core/store.ts";
 import { serveControl, type ControlRequest, type ControlResponse } from "../core/control.ts";
 import { summarizeWork } from "../core/git.ts";
@@ -64,6 +66,8 @@ export class Supervisor {
   private latestDiff: string | undefined;
   /** Tail of the serialized record-write chain (see {@link persist}). */
   private writeChain: Promise<void> = Promise.resolve();
+  /** Held for the lifetime of a write worker; see {@link acquireWriteLock}. */
+  private writeLock: WriteLock | undefined;
 
   constructor(spec: SupervisorSpec) {
     this.spec = spec;
@@ -109,6 +113,22 @@ export class Supervisor {
       if (this.record.actualModel === undefined && prior.actualModel !== undefined) {
         this.record.actualModel = prior.actualModel;
       }
+    }
+
+    // Claim the directory before anything can edit it. The bridge's scan for a
+    // conflicting writer happens before this process exists, so on its own it is
+    // check-then-act: two starts racing each other both pass it.
+    if (this.spec.writeAccess) {
+      const dir = this.spec.worktree?.path ?? this.spec.cwd;
+      const claim = await acquireWriteLock(dir, this.spec.workerId);
+      if ("heldBy" in claim) {
+        await this.fail(
+          new Error(`worker "${claim.heldBy.workerId}" (pid ${claim.heldBy.pid}) is already writing in ${dir}`),
+          "Give this worker its own worktree, or stop the one that holds the directory.",
+        );
+        return;
+      }
+      this.writeLock = claim.lock;
     }
 
     await this.persist();
@@ -504,6 +524,11 @@ export class Supervisor {
   private async teardown(): Promise<void> {
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
+    try {
+      await this.writeLock?.release();
+    } catch {
+      /* a stale lock is reclaimed by the next owner anyway */
+    }
     try {
       await this.adapter.dispose();
     } catch {

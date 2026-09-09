@@ -47,7 +47,7 @@ writes `worker.json`, appends to the journals, and updates the result snapshot.
 Bridges only read. There is no shared registry file for a Claude host and a Codex
 host to overwrite each other in - listing workers is a `readdir`.
 
-Two mechanisms keep that true in practice:
+Three mechanisms keep that true in practice:
 
 1. `writeJsonAtomic` writes to a **per-call unique** temp file and renames. A
    shared temp name (even one per process) lets two overlapping writes clobber
@@ -55,6 +55,12 @@ Two mechanisms keep that true in practice:
    covered by a test.
 2. The supervisor serializes its own record writes through a promise chain, so
    "one writer" also means "one write at a time".
+3. A write worker takes an exclusive lock on the directory it will edit, keyed
+   by a hash of that path under the state directory. The bridge's "is anyone
+   already writing here?" scan runs before either supervisor exists, so on its
+   own it is check-then-act: two starts racing each other both pass it. Creating
+   the lock is atomic, so exactly one wins. A lock whose owner is gone is
+   reclaimed, or one crash would make a directory permanently unusable.
 
 ## Ownership vs. reading
 

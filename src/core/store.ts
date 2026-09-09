@@ -223,6 +223,59 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
+/* ── write-target locks ────────────────────────────────────────────────── */
+
+/**
+ * Mutual exclusion for the directory a write worker edits.
+ *
+ * The registry's "is anyone already writing here?" check is a scan, and a scan
+ * is check-then-act: two `worker_start` calls racing each other can both pass it
+ * and both begin editing one checkout. The lock closes that window, because
+ * creating it is atomic.
+ *
+ * Locks live in the state directory, keyed by a hash of the target, so nothing
+ * is ever written into the user's repository.
+ */
+function lockPath(writeDir: string): string {
+  const hash = createHash("sha256").update(path.resolve(writeDir)).digest("hex").slice(0, 20);
+  return path.join(stateDir(), "locks", `${hash}.lock`);
+}
+
+export type WriteLock = { path: string; release: () => Promise<void> };
+
+/**
+ * Take the lock for `writeDir`, or return the record of who holds it.
+ *
+ * A lock whose owning process is gone is reclaimed - otherwise one crash would
+ * make a directory permanently unusable.
+ */
+export async function acquireWriteLock(
+  writeDir: string,
+  workerId: string,
+): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
+  const file = lockPath(writeDir);
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const payload = JSON.stringify({ workerId, pid: process.pid, dir: path.resolve(writeDir), at: new Date().toISOString() });
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await fsp.open(file, "wx");
+      await handle.writeFile(payload, "utf8");
+      await handle.close();
+      return { lock: { path: file, release: async () => fsp.rm(file, { force: true }).then(() => undefined) } };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      const held = await readJson<{ workerId: string; pid: number }>(file);
+      if (held !== undefined && held.workerId !== workerId && pidAlive(held.pid)) {
+        return { heldBy: held };
+      }
+      // Stale (crashed owner, or our own previous run): reclaim it and retry.
+      await fsp.rm(file, { force: true });
+    }
+  }
+  throw new Error(`could not acquire the write lock for ${writeDir}`);
+}
+
 /** Remove a worker's directory and socket. Used by `worker_stop --purge`. */
 export async function purgeWorker(workerId: string): Promise<void> {
   const paths = workerPaths(workerId);

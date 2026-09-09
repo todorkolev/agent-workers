@@ -365,6 +365,47 @@ describe("write isolation", () => {
     }
   });
 
+  it("refuses a second writer even when two starts race", async () => {
+    // The bridge's conflict scan runs before either supervisor exists, so on its
+    // own it is check-then-act. Starting both at once is the case that matters.
+    const dir = path.join(repo, ".worktrees", "aw-race");
+    const [a, b] = await Promise.all([
+      bridge.call("worker_start", {
+        provider: "codex",
+        workerId: "race-a",
+        cwd: repo,
+        worktreePath: dir,
+        branch: "agent/race",
+        task: "WRITE a",
+        writeAccess: true,
+        waitFor: "started",
+      }),
+      bridge.call("worker_start", {
+        provider: "claude",
+        workerId: "race-b",
+        cwd: repo,
+        worktreePath: dir,
+        branch: "agent/race",
+        task: "WRITE b",
+        writeAccess: true,
+        waitFor: "started",
+      }),
+    ]);
+    try {
+      // The invariant is "never two", not "always exactly one": two concurrent
+      // `git worktree add` calls on one path may both legitimately fail.
+      const winners = [a, b].filter((r) => !r.isError && !/state failed/.test(r.text));
+      assert.ok(winners.length <= 1, `both starts claimed the same directory:\nA: ${a.text}\n\nB: ${b.text}`);
+      const loser = [a, b].find((r) => r.isError || /state failed/.test(r.text));
+      assert.ok(loser !== undefined, "one of the racing starts had to be refused");
+      assert.match(loser.text, /already writing in|already exists|not a git worktree|failed/);
+    } finally {
+      for (const id of ["race-a", "race-b"]) {
+        await bridge.call("worker_stop", { workerId: id, takeover: true }).catch(() => undefined);
+      }
+    }
+  });
+
   it("adopts a worktree that already exists instead of recreating its branch", async () => {
     const dir = path.join(repo, ".worktrees", "aw-wt-writer");
     // Same worktree, same branch, second worker: this is the case that used to

@@ -92,6 +92,40 @@ function appendText(file, text) {
 async function readRecord(workerId) {
   return readJson(workerPaths(workerId).record);
 }
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+function lockPath(writeDir) {
+  const hash = createHash("sha256").update(path.resolve(writeDir)).digest("hex").slice(0, 20);
+  return path.join(stateDir(), "locks", `${hash}.lock`);
+}
+async function acquireWriteLock(writeDir, workerId) {
+  const file = lockPath(writeDir);
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const payload = JSON.stringify({ workerId, pid: process.pid, dir: path.resolve(writeDir), at: (/* @__PURE__ */ new Date()).toISOString() });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await fsp.open(file, "wx");
+      await handle.writeFile(payload, "utf8");
+      await handle.close();
+      return { lock: { path: file, release: async () => fsp.rm(file, { force: true }).then(() => void 0) } };
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      const held = await readJson(file);
+      if (held !== void 0 && held.workerId !== workerId && pidAlive(held.pid)) {
+        return { heldBy: held };
+      }
+      await fsp.rm(file, { force: true });
+    }
+  }
+  throw new Error(`could not acquire the write lock for ${writeDir}`);
+}
 
 // src/core/logger.ts
 var ORDER = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -1281,6 +1315,8 @@ var Supervisor = class {
   latestDiff;
   /** Tail of the serialized record-write chain (see {@link persist}). */
   writeChain = Promise.resolve();
+  /** Held for the lifetime of a write worker; see {@link acquireWriteLock}. */
+  writeLock;
   constructor(spec) {
     this.spec = spec;
     this.adapter = spec.provider === "claude" ? new ClaudeCliAdapter() : new CodexAppServerAdapter();
@@ -1318,6 +1354,18 @@ var Supervisor = class {
       if (this.record.actualModel === void 0 && prior.actualModel !== void 0) {
         this.record.actualModel = prior.actualModel;
       }
+    }
+    if (this.spec.writeAccess) {
+      const dir = this.spec.worktree?.path ?? this.spec.cwd;
+      const claim = await acquireWriteLock(dir, this.spec.workerId);
+      if ("heldBy" in claim) {
+        await this.fail(
+          new Error(`worker "${claim.heldBy.workerId}" (pid ${claim.heldBy.pid}) is already writing in ${dir}`),
+          "Give this worker its own worktree, or stop the one that holds the directory."
+        );
+        return;
+      }
+      this.writeLock = claim.lock;
     }
     await this.persist();
     this.server = await serveControl(this.record.paths.socket, (req) => this.handleControl(req));
@@ -1662,6 +1710,10 @@ var Supervisor = class {
   async teardown() {
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
+    try {
+      await this.writeLock?.release();
+    } catch {
+    }
     try {
       await this.adapter.dispose();
     } catch {
