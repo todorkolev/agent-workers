@@ -12,6 +12,7 @@ var __export = (target, all) => {
 // src/core/store.ts
 var store_exports = {};
 __export(store_exports, {
+  WORKER_ID_PATTERN: () => WORKER_ID_PATTERN,
   acquireSupervisorLock: () => acquireSupervisorLock,
   acquireWriteLock: () => acquireWriteLock,
   appendLine: () => appendLine,
@@ -51,7 +52,11 @@ function socketDir() {
   return base.length > 80 ? path.join(os.tmpdir(), `agent-workers-${process.getuid?.() ?? 0}`) : base;
 }
 function workerDir(workerId) {
-  return path.join(stateDir(), "workers", workerId);
+  if (!WORKER_ID_PATTERN.test(workerId)) throw new Error("invalid worker id: expected 1-64 letters, digits, underscores or hyphens, starting with a letter or digit");
+  const root = path.resolve(stateDir(), "workers");
+  const dir = path.resolve(root, workerId);
+  if (path.dirname(dir) !== root) throw new Error("worker directory must be directly inside the state workers directory");
+  return dir;
 }
 function workerPaths(workerId) {
   const dir = workerDir(workerId);
@@ -309,10 +314,11 @@ async function purgeWorker(workerId) {
   await fsp.rm(paths.dir, { recursive: true, force: true });
   await fsp.rm(paths.socket, { force: true });
 }
-var tmpCounter;
+var WORKER_ID_PATTERN, tmpCounter;
 var init_store = __esm({
   "src/core/store.ts"() {
     "use strict";
+    WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
     tmpCounter = 0;
   }
 });
@@ -1027,7 +1033,7 @@ var CodexAppServerAdapter = class {
   nextId = 1;
   pending = /* @__PURE__ */ new Map();
   parked = /* @__PURE__ */ new Map();
-  completedTurns = /* @__PURE__ */ new Set();
+  completedTurns = /* @__PURE__ */ new Map();
   interruptTimeoutMs = 3e4;
   exitError;
   /** Text of the most recent completed agentMessage; becomes the turn's final. */
@@ -1148,7 +1154,7 @@ var CodexAppServerAdapter = class {
   async interrupt() {
     const threadId = this.threadId;
     const turnId = this._turnId;
-    if (threadId === void 0 || turnId === void 0) return;
+    if (threadId === void 0 || turnId === void 0) throw new Error("There is no active Codex turn to cancel");
     try {
       await this.request("turn/interrupt", { threadId, turnId }, this.interruptTimeoutMs);
     } catch (err) {
@@ -1160,6 +1166,8 @@ var CodexAppServerAdapter = class {
       if (Date.now() >= deadline) throw new Error(`interrupt of ${turnId} was not confirmed; the turn may still be running`);
       await delay(10);
     }
+    const status = this.completedTurns.get(turnId);
+    if (status !== "interrupted") throw new Error(`turn ${turnId} ended with status ${status}; cancellation was not confirmed`);
   }
   /** Answer a parked approval / user-input request with the manager's decision. */
   async respond(requestId, decision) {
@@ -1394,10 +1402,10 @@ var CodexAppServerAdapter = class {
       }
       case "turn/completed": {
         const completedId = str2(rec2(p["turn"])?.["id"]) ?? turnId;
-        if (completedId !== void 0) this.completedTurns.add(completedId);
-        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.values().next().value);
-        if (this._turnId !== void 0 && completedId !== this._turnId) return;
         const status = str2(rec2(p["turn"])?.["status"]) ?? "completed";
+        if (completedId !== void 0) this.completedTurns.set(completedId, status);
+        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.keys().next().value);
+        if (this._turnId !== void 0 && completedId !== this._turnId) return;
         if (this.lastAgentMessage !== void 0 && status !== "interrupted") {
           this.emit({ ts, type: "final", rawType: method, text: this.lastAgentMessage, ...withTurn });
         }
@@ -1609,7 +1617,7 @@ var Supervisor = class {
       this.seq = Math.max(prior.lastSeq, journalSeq);
       this.record.lastSeq = this.seq;
       this.record.createdAt = prior.createdAt;
-      if (this.record.actualModel === void 0 && prior.actualModel !== void 0) {
+      if (this.spec.resumeSessionId !== void 0 && this.record.actualModel === void 0 && prior.actualModel !== void 0) {
         this.record.actualModel = prior.actualModel;
       }
       if (this.spec.resumeSessionId !== void 0) this.queued.push(...prior.queued ?? []);
@@ -1617,6 +1625,11 @@ var Supervisor = class {
       if (snapshot !== void 0 && this.spec.resumeSessionId !== void 0) {
         this.lastFinal = snapshot.final;
         for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
+      }
+    }
+    if (this.spec.resumeSessionId === void 0) {
+      for (const file of [this.record.paths.result, this.record.paths.final, this.record.paths.diff, this.record.paths.changedFiles]) {
+        await fsp2.rm(file, { force: true });
       }
     }
     if (this.spec.writeAccess) {
@@ -1730,7 +1743,9 @@ var Supervisor = class {
         break;
       case "turn_completed":
         this.record.turnId = void 0;
-        await this.setState(this.interruptRequested ? "interrupted" : "idle");
+        await this.setState(
+          this.spec.provider === "codex" ? event.data?.["status"] === "interrupted" ? "interrupted" : "idle" : this.interruptRequested ? "interrupted" : "idle"
+        );
         await this.snapshotResult();
         await this.drainQueue();
         return;
@@ -1849,6 +1864,9 @@ var Supervisor = class {
   async opInterrupt() {
     if (this.isTerminal()) {
       return { ok: false, code: "terminal", error: `worker is ${this.record.state}` };
+    }
+    if (this.record.turnId === void 0) {
+      return { ok: false, code: "bad_request", error: "There is no active turn to cancel; the worker is unchanged." };
     }
     this.interruptRequested = true;
     try {

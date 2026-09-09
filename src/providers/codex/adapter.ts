@@ -94,7 +94,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
   private nextId = 1;
   private readonly pending = new Map<JsonRpcId, { resolve: (v: unknown) => void; reject: (e: Error) => void; method: string }>();
   private readonly parked = new Map<string, ParkedRequest>();
-  private readonly completedTurns = new Set<string>();
+  private readonly completedTurns = new Map<string, string>();
   private interruptTimeoutMs = 30_000;
   private exitError: Error | undefined;
   /** Text of the most recent completed agentMessage; becomes the turn's final. */
@@ -245,7 +245,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
   async interrupt(): Promise<void> {
     const threadId = this.threadId;
     const turnId = this._turnId;
-    if (threadId === undefined || turnId === undefined) return;
+    if (threadId === undefined || turnId === undefined) throw new Error("There is no active Codex turn to cancel");
     try {
       await this.request("turn/interrupt", { threadId, turnId }, this.interruptTimeoutMs);
     } catch (err) {
@@ -257,6 +257,8 @@ export class CodexAppServerAdapter implements ProviderAdapter {
       if (Date.now() >= deadline) throw new Error(`interrupt of ${turnId} was not confirmed; the turn may still be running`);
       await delay(10);
     }
+    const status = this.completedTurns.get(turnId);
+    if (status !== "interrupted") throw new Error(`turn ${turnId} ended with status ${status}; cancellation was not confirmed`);
   }
 
   /** Answer a parked approval / user-input request with the manager's decision. */
@@ -507,10 +509,10 @@ export class CodexAppServerAdapter implements ProviderAdapter {
       }
       case "turn/completed": {
         const completedId = str(rec(p["turn"])?.["id"]) ?? turnId;
-        if (completedId !== undefined) this.completedTurns.add(completedId);
-        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.values().next().value!);
-        if (this._turnId !== undefined && completedId !== this._turnId) return;
         const status = str(rec(p["turn"])?.["status"]) ?? "completed";
+        if (completedId !== undefined) this.completedTurns.set(completedId, status);
+        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.keys().next().value!);
+        if (this._turnId !== undefined && completedId !== this._turnId) return;
         // Codex has no distinct "final answer" message: the agent's answer is
         // the last completed agentMessage before the turn ends. Without marking
         // it, worker_result would have nothing to report for a Codex worker

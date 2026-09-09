@@ -145,7 +145,7 @@ export class Supervisor {
       this.seq = Math.max(prior.lastSeq, journalSeq);
       this.record.lastSeq = this.seq;
       this.record.createdAt = prior.createdAt;
-      if (this.record.actualModel === undefined && prior.actualModel !== undefined) {
+      if (this.spec.resumeSessionId !== undefined && this.record.actualModel === undefined && prior.actualModel !== undefined) {
         this.record.actualModel = prior.actualModel;
       }
       // Restore what a manager would otherwise silently lose on recovery.
@@ -154,6 +154,14 @@ export class Supervisor {
       if (snapshot !== undefined && this.spec.resumeSessionId !== undefined) {
         this.lastFinal = snapshot.final;
         for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
+      }
+    }
+
+    if (this.spec.resumeSessionId === undefined) {
+      // A fresh run must never expose a stopped run's result if startup fails.
+      // The worker-id lock makes this reset exclusive; the journal stays intact.
+      for (const file of [this.record.paths.result, this.record.paths.final, this.record.paths.diff, this.record.paths.changedFiles]) {
+        await fsp.rm(file, { force: true });
       }
     }
 
@@ -304,7 +312,11 @@ export class Supervisor {
         this.record.turnId = undefined;
         // An interrupt stays visible until the manager does something with the
         // worker; reporting plain `idle` would hide that work was cut short.
-        await this.setState(this.interruptRequested ? "interrupted" : "idle");
+        await this.setState(
+          this.spec.provider === "codex"
+            ? (event.data?.["status"] === "interrupted" ? "interrupted" : "idle")
+            : (this.interruptRequested ? "interrupted" : "idle"),
+        );
         await this.snapshotResult();
         await this.drainQueue();
         return;
@@ -433,6 +445,9 @@ export class Supervisor {
   private async opInterrupt(): Promise<ControlResponse> {
     if (this.isTerminal()) {
       return { ok: false, code: "terminal", error: `worker is ${this.record.state}` };
+    }
+    if (this.record.turnId === undefined) {
+      return { ok: false, code: "bad_request", error: "There is no active turn to cancel; the worker is unchanged." };
     }
     this.interruptRequested = true;
     try {

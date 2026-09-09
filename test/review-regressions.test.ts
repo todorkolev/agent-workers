@@ -8,10 +8,12 @@ import { Writable } from "node:stream";
 import { once } from "node:events";
 import { after, it } from "node:test";
 import { pathToFileURL } from "node:url";
-import { ensureDirs, privateDir, workerPaths, writeJsonAtomic, appendLine, appendText, acquireWriteLock } from "../src/core/store.ts";
+import { ensureDirs, privateDir, workerDir, purgeWorker, workerPaths, writeJsonAtomic, appendLine, appendText, acquireWriteLock } from "../src/core/store.ts";
 import { ensureWorktree, resolveCommit, summarizeWork } from "../src/core/git.ts";
 import { terminateChild } from "../src/core/process.ts";
 import { CodexAppServerAdapter } from "../src/providers/codex/adapter.ts";
+import { z } from "zod";
+import { startSchema, readSchema, waitSchema, sendSchema, respondSchema, workerIdSchema, resumeSchema, stopSchema, traceSchema } from "../src/bridge/tools.ts";
 import { Supervisor } from "../src/supervisor/supervisor.ts";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aw-review-"));
@@ -179,4 +181,58 @@ it("serializes timeout denial and a concurrent manager answer into one provider 
   release();assert.equal((await reply).ok,false);
   assert.equal(s.record.pending.length,0);assert.equal(writes,1);
   clearTimeout(keepAlive);
+});
+
+
+it("does not claim cancellation of idle or normally completed Codex turns", async () => {
+  const a:any=new CodexAppServerAdapter(); a.threadId="thread";
+  await assert.rejects(a.interrupt(),/no active/);
+  a._turnId="finished";
+  a.request=async()=>{a.onNotification("turn/completed",{turn:{id:"finished",status:"completed"}});return {};};
+  await assert.rejects(a.interrupt(),/cancellation was not confirmed/);
+  const s=supervisor("idle-interrupt"); s.record.state="idle";
+  assert.equal((await s.opInterrupt()).ok,false);
+  assert.equal(s.record.state,"idle");
+});
+
+it("keeps normal completion truthful when it races an interrupt", async () => {
+  await ensureDirs("completed-race");
+  const s=supervisor("completed-race"); s.record.state="running";s.record.turnId="turn";
+  s.adapter={interrupt:async()=>{
+    await s.onEvent({ts:new Date().toISOString(),type:"turn_completed",data:{status:"completed"}});
+    throw new Error("turn completed normally; cancellation was not confirmed");
+  }};
+  assert.equal((await s.opInterrupt()).ok,false);
+  assert.equal(s.record.state,"idle");
+});
+
+it("clears old result and model when a fresh reused worker fails during startup", async () => {
+  await ensureDirs("fresh-failure");
+  const s=supervisor("fresh-failure"),p=s.record.paths;
+  await writeJsonAtomic(p.record,{...s.record,state:"stopped",actualModel:"old-model"});
+  for (const file of [p.result,p.final,p.diff,p.changedFiles]) fs.writeFileSync(file, file===p.result ? JSON.stringify({final:"old final",changedFiles:["old"],commit:{hash:"old"}}) : "old artifact");
+  s.adapter={onRaw:()=>{},onStderr:()=>{},onEvent:()=>{},onExit:()=>{},start:async()=>{throw new Error("startup failed");}};
+  s.teardown=async()=>{s.server?.close();await s.supervisorLock?.release();};
+  await s.run();await s.writeChain;
+  assert.equal(s.record.state,"failed");
+  assert.equal(s.record.actualModel,undefined);
+  for (const file of [p.result,p.final,p.diff,p.changedFiles]) assert.equal(fs.existsSync(file),false,file);
+  const saved=JSON.parse(fs.readFileSync(p.record,"utf8"));
+  assert.equal(saved.actualModel,undefined);
+});
+
+
+it("rejects path-like worker ids at every tool and filesystem boundary before purge", async () => {
+  const victim=path.join(tmp,"victim");fs.mkdirSync(victim);fs.writeFileSync(path.join(victim,"keep"),"keep");
+  const ids=["../../victim",victim,"..","a/b","a\\b","","x".repeat(65)];
+  for (const id of ids) {
+    for (const schema of [startSchema,readSchema,waitSchema,sendSchema,respondSchema,workerIdSchema,resumeSchema,stopSchema,traceSchema]) {
+      assert.equal(z.object({workerId:schema.workerId}).safeParse({workerId:id}).success,false,id);
+    }
+    assert.throws(()=>workerDir(id),/invalid worker id/);
+    await assert.rejects(purgeWorker(id),/invalid worker id/);
+  }
+  assert.equal(fs.readFileSync(path.join(victim,"keep"),"utf8"),"keep");
+  await ensureDirs("valid-purge");await purgeWorker("valid-purge");
+  assert.equal(fs.existsSync(workerDir("valid-purge")),false);
 });

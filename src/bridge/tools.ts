@@ -25,7 +25,7 @@ import {
 } from "../core/config.ts";
 import { probeProvider } from "../core/availability.ts";
 import { ensureWorktree, repoRoot } from "../core/git.ts";
-import { acquireSupervisorLock, canonical, readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
+import { WORKER_ID_PATTERN, acquireSupervisorLock, canonical, readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
 import {
   DEFAULT_TRANSCRIPT_MODE,
   isTerminalState,
@@ -68,15 +68,14 @@ const fail = (text: string): ToolOutput => ({ text, isError: true });
  * Schemas
  * --------------------------------------------------------------------- */
 
+const safeWorkerIdSchema = z.string().regex(WORKER_ID_PATTERN);
 const providerSchema = z.enum(["claude", "codex"]);
 const transcriptSchema = z.enum(["messages", "activity", "verbose"]);
 
 export const startSchema = {
   provider: providerSchema.describe("Which backend runs this worker: claude or codex."),
   task: z.string().min(1).describe("The worker's opening instruction. It becomes the first turn."),
-  workerId: z
-    .string()
-    .regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/)
+  workerId: safeWorkerIdSchema
     .optional()
     .describe("Stable id, reused across restarts. Derived from the task when omitted."),
   model: z
@@ -132,7 +131,7 @@ export const startSchema = {
 };
 
 export const readSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   cursor: z.number().int().min(0).optional().describe("Return only events after this sequence number. Default 0."),
   maxChars: z.number().int().min(200).max(120000).optional(),
   maxMessages: z.number().int().min(1).max(500).optional(),
@@ -140,7 +139,7 @@ export const readSchema = {
 };
 
 export const waitSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   cursor: z.number().int().min(0).optional().describe("Wait for an event after this sequence number."),
   timeoutMs: z
     .number()
@@ -160,13 +159,13 @@ export const waitSchema = {
 };
 
 export const sendSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   text: z.string().min(1),
   takeover: z.boolean().optional().describe("Take control of a worker another manager owns."),
 };
 
 export const respondSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   requestId: z.string().describe("From the permission_request or question event."),
   decision: z.enum(["allow", "deny", "answer"]),
   answers: z.record(z.array(z.string())).optional().describe("For multiple questions: answers keyed by the question IDs shown in worker_read. Supply every question ID."),
@@ -174,16 +173,16 @@ export const respondSchema = {
   takeover: z.boolean().optional(),
 };
 
-export const workerIdSchema = { workerId: z.string(), takeover: z.boolean().optional() };
+export const workerIdSchema = { workerId: safeWorkerIdSchema, takeover: z.boolean().optional() };
 
 export const resumeSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   task: z.string().optional().describe("Optional instruction to send once the session is back."),
   takeover: z.boolean().optional(),
 };
 
 export const stopSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   purge: z.boolean().optional().describe("Also delete the worker's journals and artifacts."),
   takeover: z.boolean().optional(),
 };
@@ -195,7 +194,7 @@ export const listSchema = {
 };
 
 export const traceSchema = {
-  workerId: z.string(),
+  workerId: safeWorkerIdSchema,
   cursor: z.number().int().min(0).optional(),
   maxChars: z.number().int().min(200).max(200000).optional(),
 };

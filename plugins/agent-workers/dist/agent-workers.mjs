@@ -21482,8 +21482,13 @@ function socketDir() {
   const base = runtime && runtime.length > 0 ? path.join(runtime, "agent-workers") : path.join(stateDir(), "sockets");
   return base.length > 80 ? path.join(os.tmpdir(), `agent-workers-${process.getuid?.() ?? 0}`) : base;
 }
+var WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 function workerDir(workerId) {
-  return path.join(stateDir(), "workers", workerId);
+  if (!WORKER_ID_PATTERN.test(workerId)) throw new Error("invalid worker id: expected 1-64 letters, digits, underscores or hyphens, starting with a letter or digit");
+  const root = path.resolve(stateDir(), "workers");
+  const dir = path.resolve(root, workerId);
+  if (path.dirname(dir) !== root) throw new Error("worker directory must be directly inside the state workers directory");
+  return dir;
 }
 function workerPaths(workerId) {
   const dir = workerDir(workerId);
@@ -22296,12 +22301,13 @@ ${result.final}` : "The worker has not produced a final answer yet.");
 // src/bridge/tools.ts
 var ok = (text) => ({ text });
 var fail = (text) => ({ text, isError: true });
+var safeWorkerIdSchema = external_exports.string().regex(WORKER_ID_PATTERN);
 var providerSchema = external_exports.enum(["claude", "codex"]);
 var transcriptSchema = external_exports.enum(["messages", "activity", "verbose"]);
 var startSchema = {
   provider: providerSchema.describe("Which backend runs this worker: claude or codex."),
   task: external_exports.string().min(1).describe("The worker's opening instruction. It becomes the first turn."),
-  workerId: external_exports.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/).optional().describe("Stable id, reused across restarts. Derived from the task when omitted."),
+  workerId: safeWorkerIdSchema.optional().describe("Stable id, reused across restarts. Derived from the task when omitted."),
   model: external_exports.string().optional().describe(
     "Model name, forwarded to the backend verbatim (e.g. 'opus', 'gpt-5.6-sol'). Never rewritten or substituted; an unknown name fails loudly."
   ),
@@ -22328,14 +22334,14 @@ var startSchema = {
   waitMs: external_exports.number().int().min(0).max(6e5).optional().describe("Upper bound for waitFor. Default 30000.")
 };
 var readSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   cursor: external_exports.number().int().min(0).optional().describe("Return only events after this sequence number. Default 0."),
   maxChars: external_exports.number().int().min(200).max(12e4).optional(),
   maxMessages: external_exports.number().int().min(1).max(500).optional(),
   mode: transcriptSchema.optional().describe("Override the worker's transcript mode for this read.")
 };
 var waitSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   cursor: external_exports.number().int().min(0).optional().describe("Wait for an event after this sequence number."),
   timeoutMs: external_exports.number().int().min(1e3).max(24e4).optional().describe(
     "How long to block, default 45000. Kept under a minute by default because a host's own MCP request timeout (often 60s) applies to this call - a longer wait surfaces as a protocol timeout, not as a result. Just call it again to keep waiting."
@@ -22343,26 +22349,26 @@ var waitSchema = {
   until: external_exports.enum(["message", "idle", "blocked", "end"]).optional().describe("What to wait for. Default 'message': any new event, question or state change.")
 };
 var sendSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   text: external_exports.string().min(1),
   takeover: external_exports.boolean().optional().describe("Take control of a worker another manager owns.")
 };
 var respondSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   requestId: external_exports.string().describe("From the permission_request or question event."),
   decision: external_exports.enum(["allow", "deny", "answer"]),
   answers: external_exports.record(external_exports.array(external_exports.string())).optional().describe("For multiple questions: answers keyed by the question IDs shown in worker_read. Supply every question ID."),
   text: external_exports.string().optional().describe("The answer, or the reason for a denial."),
   takeover: external_exports.boolean().optional()
 };
-var workerIdSchema = { workerId: external_exports.string(), takeover: external_exports.boolean().optional() };
+var workerIdSchema = { workerId: safeWorkerIdSchema, takeover: external_exports.boolean().optional() };
 var resumeSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   task: external_exports.string().optional().describe("Optional instruction to send once the session is back."),
   takeover: external_exports.boolean().optional()
 };
 var stopSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   purge: external_exports.boolean().optional().describe("Also delete the worker's journals and artifacts."),
   takeover: external_exports.boolean().optional()
 };
@@ -22372,7 +22378,7 @@ var listSchema = {
   live: external_exports.boolean().optional().describe("Only workers whose supervisor is alive.")
 };
 var traceSchema = {
-  workerId: external_exports.string(),
+  workerId: safeWorkerIdSchema,
   cursor: external_exports.number().int().min(0).optional(),
   maxChars: external_exports.number().int().min(200).max(2e5).optional()
 };

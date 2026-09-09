@@ -44,9 +44,16 @@ export function socketDir(): string {
   return base.length > 80 ? path.join(os.tmpdir(), `agent-workers-${process.getuid?.() ?? 0}`) : base;
 }
 
+/** Worker ids are names, never filesystem paths. Shared with every MCP schema. */
+export const WORKER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
 /** Absolute path of a worker's directory. */
 export function workerDir(workerId: string): string {
-  return path.join(stateDir(), "workers", workerId);
+  if (!WORKER_ID_PATTERN.test(workerId)) throw new Error("invalid worker id: expected 1-64 letters, digits, underscores or hyphens, starting with a letter or digit");
+  const root = path.resolve(stateDir(), "workers");
+  const dir = path.resolve(root, workerId);
+  if (path.dirname(dir) !== root) throw new Error("worker directory must be directly inside the state workers directory");
+  return dir;
 }
 
 /** Every artifact path for one worker. */
