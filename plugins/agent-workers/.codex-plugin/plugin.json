@@ -1,11 +1,35 @@
 {
-  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "agent-workers",
   "version": "0.1.1",
   "description": "Persistent, interactive Claude and Codex workers, driven through one MCP tool contract.",
-  "author": { "name": "Todor Kolev" },
+  "author": {
+    "name": "Todor Kolev"
+  },
   "homepage": "https://github.com/todorkolev/agent-workers",
   "repository": "https://github.com/todorkolev/agent-workers",
   "license": "MIT",
-  "keywords": ["agents", "workers", "codex", "claude", "delegation", "mcp"]
+  "keywords": [
+    "agents",
+    "workers",
+    "codex",
+    "claude",
+    "delegation",
+    "mcp"
+  ],
+  "interface": {
+    "displayName": "Agent Workers",
+    "shortDescription": "Interactive Claude and Codex workers",
+    "longDescription": "Start, guide, interrupt and resume Claude or Codex workers from either coding assistant. Workers preserve their sessions and return messages, changes and results.",
+    "developerName": "Todor Kolev",
+    "category": "DeveloperTools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/todorkolev/agent-workers",
+    "defaultPrompt": [
+      "Start a Claude worker on an isolated task.",
+      "Ask a Codex worker to review a candidate commit."
+    ]
+  }
 }
