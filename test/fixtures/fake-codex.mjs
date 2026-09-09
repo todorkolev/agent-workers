@@ -18,6 +18,10 @@ if (argv.includes("--version")) {
   process.exit(0);
 }
 if (argv[0] === "login" && argv[1] === "status") {
+  if (process.env.FAKE_CODEX_LOGGED_OUT === "1") {
+    process.stdout.write("Not logged in\n");
+    process.exit(1);
+  }
   process.stdout.write("Logged in using ChatGPT\n");
   process.exit(0);
 }

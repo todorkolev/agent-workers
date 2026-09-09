@@ -78,7 +78,11 @@ async function probeCodex(bin: string, launcher: string[]): Promise<ProviderAvai
   }
   const login = await run([...launcher, bin, "login", "status"], 20_000);
   const combined = `${login.stdout}\n${login.stderr}`.toLowerCase();
-  const loggedIn = login.code === 0 || combined.includes("logged in");
+  // "Not logged in" contains "logged in", so the negative has to be checked
+  // first - otherwise a logged-out CLI reads as logged in and the worker is
+  // started only to die on its first turn.
+  const loggedOut = combined.includes("not logged in") || combined.includes("logged out");
+  const loggedIn = !loggedOut && (login.code === 0 || combined.includes("logged in"));
   if (!loggedIn) {
     return {
       provider: "codex",

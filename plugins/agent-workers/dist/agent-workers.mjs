@@ -21714,7 +21714,8 @@ async function probeCodex(bin, launcher) {
   const login = await run([...launcher, bin, "login", "status"], 2e4);
   const combined = `${login.stdout}
 ${login.stderr}`.toLowerCase();
-  const loggedIn = login.code === 0 || combined.includes("logged in");
+  const loggedOut = combined.includes("not logged in") || combined.includes("logged out");
+  const loggedIn = !loggedOut && (login.code === 0 || combined.includes("logged in"));
   if (!loggedIn) {
     return {
       provider: "codex",

@@ -37,7 +37,7 @@ type Bridge = {
   close(): Promise<void>;
 };
 
-async function openBridge(clientId: string): Promise<Bridge> {
+async function openBridge(clientId: string, extraEnv: Record<string, string> = {}): Promise<Bridge> {
   const client = new Client({ name: `test-${clientId}`, version: "1.0.0" }, { capabilities: {} });
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -50,6 +50,7 @@ async function openBridge(clientId: string): Promise<Bridge> {
       AGENT_WORKERS_CLAUDE_BIN: fakeClaude,
       AGENT_WORKERS_CODEX_BIN: fakeCodex,
       AGENT_WORKERS_LOG: "error",
+      ...extraEnv,
     },
     stderr: "ignore",
   });
@@ -496,6 +497,24 @@ describe("failure reporting", () => {
       const text = ((res.content ?? []) as Array<{ text?: string }>).map((c) => c.text ?? "").join("");
       assert.equal(res.isError, true);
       assert.match(text, /unknown execProfile/);
+    } finally {
+      await other.close().catch(() => undefined);
+    }
+  });
+
+  it("refuses to start when the provider CLI is not logged in", async () => {
+    // The real CLI on a developer machine reports logged in even from an
+    // isolated home, so this branch is only reachable with a scripted provider.
+    const other = await openBridge("test-logged-out", { FAKE_CODEX_LOGGED_OUT: "1" });
+    try {
+      const res = await other.client.callTool({
+        name: "worker_start",
+        arguments: { provider: "codex", cwd: projectDir, task: "x", workerId: "logged-out" },
+      });
+      const text = ((res.content ?? []) as Array<{ text?: string }>).map((c) => c.text ?? "").join("");
+      assert.equal(res.isError, true, text);
+      assert.match(text, /not logged in/);
+      assert.match(text, /codex login/);
     } finally {
       await other.close().catch(() => undefined);
     }

@@ -14,6 +14,7 @@ import { after, describe, it } from "node:test";
 import { appendLine, pidAlive, readSince, writeJsonAtomic } from "../src/core/store.ts";
 import { launcherArgv, resolveExecProfile, toHostPath, toTargetPath } from "../src/core/config.ts";
 import { controlRequest, serveControl } from "../src/core/control.ts";
+import { probeProvider } from "../src/core/availability.ts";
 import { keepEvent, renderEvents } from "../src/bridge/render.ts";
 import type { Config } from "../src/core/config.ts";
 import type { ExecProfile, WorkerEvent } from "../src/core/types.ts";
@@ -170,6 +171,40 @@ describe("exec profiles", () => {
     };
     assert.throws(() => resolveExecProfile(cfg, "nope"), /unknown execProfile "nope"/);
     assert.equal(resolveExecProfile(cfg, undefined).name, "local");
+  });
+});
+
+describe("login detection", () => {
+  it('treats "Not logged in" as logged out, not as a match for "logged in"', async () => {
+    // The substring trap: a naive includes("logged in") reports a logged-out CLI
+    // as ready, and the worker only fails later, on its first turn.
+    const fake = path.join(tmp, "fake-cli.sh");
+    fs.writeFileSync(
+      fake,
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 9.9.9"; exit 0; fi\necho "Not logged in"; exit 1\n',
+    );
+    fs.chmodSync(fake, 0o755);
+    const res = await probeProvider("codex", fake);
+    assert.equal(res.available, false, JSON.stringify(res));
+    assert.match(res.error ?? "", /not logged in/);
+    assert.match(res.recovery ?? "", /codex login/);
+  });
+
+  it("accepts a logged-in CLI", async () => {
+    const fake = path.join(tmp, "fake-ok.sh");
+    fs.writeFileSync(
+      fake,
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "codex-cli 9.9.9"; exit 0; fi\necho "Logged in using ChatGPT"; exit 0\n',
+    );
+    fs.chmodSync(fake, 0o755);
+    const res = await probeProvider("codex", fake);
+    assert.equal(res.available, true, JSON.stringify(res));
+  });
+
+  it("reports a missing binary rather than guessing", async () => {
+    const res = await probeProvider("claude", path.join(tmp, "definitely-not-here"));
+    assert.equal(res.available, false);
+    assert.match(res.error ?? "", /not runnable/);
   });
 });
 
