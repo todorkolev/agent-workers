@@ -89,6 +89,8 @@ export class CodexAppServerAdapter implements ProviderAdapter {
   private readonly parked = new Map<string, ParkedRequest>();
   private turnEndWaiters: Array<() => void> = [];
   private exitError: Error | undefined;
+  /** Text of the most recent completed agentMessage; becomes the turn's final. */
+  private lastAgentMessage: string | undefined;
 
   private readonly rawCbs: Array<(msg: unknown) => void> = [];
   private readonly eventCbs: Array<(ev: Emitted) => void> = [];
@@ -477,6 +479,14 @@ export class CodexAppServerAdapter implements ProviderAdapter {
       }
       case "turn/completed": {
         const status = str(rec(p["turn"])?.["status"]) ?? "completed";
+        // Codex has no distinct "final answer" message: the agent's answer is
+        // the last completed agentMessage before the turn ends. Without marking
+        // it, worker_result would have nothing to report for a Codex worker
+        // even though it clearly answered.
+        if (this.lastAgentMessage !== undefined && status !== "interrupted") {
+          this.emit({ ts, type: "final", rawType: method, text: this.lastAgentMessage, ...withTurn });
+        }
+        this.lastAgentMessage = undefined;
         this.emit({ ts, type: "turn_completed", rawType: method, text: `turn ${status}`, ...withTurn, data: { status } });
         this._turnId = undefined;
         this.resolveTurnEnd();
@@ -543,6 +553,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
       if (!completed) return;
       const text = str(item["text"]);
       if (text === undefined || text.trim().length === 0) return;
+      this.lastAgentMessage = text;
       this.emit({ ts, type: "agent_message", rawType: method, text, ...withTurn });
       return;
     }

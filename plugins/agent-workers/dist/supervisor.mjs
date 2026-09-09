@@ -779,6 +779,8 @@ var CodexAppServerAdapter = class {
   parked = /* @__PURE__ */ new Map();
   turnEndWaiters = [];
   exitError;
+  /** Text of the most recent completed agentMessage; becomes the turn's final. */
+  lastAgentMessage;
   rawCbs = [];
   eventCbs = [];
   stderrCbs = [];
@@ -1120,6 +1122,10 @@ var CodexAppServerAdapter = class {
       }
       case "turn/completed": {
         const status = str2(rec2(p["turn"])?.["status"]) ?? "completed";
+        if (this.lastAgentMessage !== void 0 && status !== "interrupted") {
+          this.emit({ ts, type: "final", rawType: method, text: this.lastAgentMessage, ...withTurn });
+        }
+        this.lastAgentMessage = void 0;
         this.emit({ ts, type: "turn_completed", rawType: method, text: `turn ${status}`, ...withTurn, data: { status } });
         this._turnId = void 0;
         this.resolveTurnEnd();
@@ -1183,6 +1189,7 @@ var CodexAppServerAdapter = class {
       if (!completed) return;
       const text = str2(item["text"]);
       if (text === void 0 || text.trim().length === 0) return;
+      this.lastAgentMessage = text;
       this.emit({ ts, type: "agent_message", rawType: method, text, ...withTurn });
       return;
     }

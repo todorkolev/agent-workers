@@ -179,8 +179,16 @@ for (const provider of ["claude", "codex"] as const) {
       const recalled = await readUntil(bridge, workerId, (all) => /halcyon/.test(all), { from: first.cursor });
       assert.ok(recalled.hit, `the worker did not recall across turns:\n${recalled.all}`);
 
+      // Both providers must produce a final answer: Codex has no distinct
+      // "final" message, so its last agentMessage before turn/completed is it.
+      for (let i = 0; i < 20; i += 1) {
+        const status = await bridge.call("worker_status", { workerId });
+        if (/state idle/.test(status.text)) break;
+        await sleep(200);
+      }
       const result = await bridge.call("worker_result", { workerId });
       assert.match(result.text, /final answer/);
+      assert.doesNotMatch(result.text, /has not produced a final answer/);
       await bridge.call("worker_stop", { workerId });
     });
 
