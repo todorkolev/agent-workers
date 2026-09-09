@@ -23,7 +23,7 @@ claude
 ```
 
 ```
-/plugin marketplace add todorkolev/agentic-workers
+/plugin marketplace add todorkolev/agent-workers
 /plugin install agent-workers@agent-workers
 ```
 
@@ -61,7 +61,7 @@ be started twice:
 ## Codex
 
 ```bash
-codex plugin marketplace add todorkolev/agentic-workers
+codex plugin marketplace add todorkolev/agent-workers
 codex plugin add agent-workers@agent-workers
 ```
 
@@ -76,7 +76,7 @@ codex mcp list
 <summary>Manual MCP entry instead of the plugin</summary>
 
 ```bash
-git clone https://github.com/todorkolev/agentic-workers.git ~/src/agent-workers
+git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
 codex mcp add agent-workers -- node ~/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs
 ```
 
@@ -156,7 +156,7 @@ worker_stop(workerId="<id>")
 For the maintainer-level check against the real CLIs:
 
 ```bash
-git clone https://github.com/todorkolev/agentic-workers.git
+git clone https://github.com/todorkolev/agent-workers.git
 cd agent-workers && npm install && npm run check     # no model usage
 
 AGENT_WORKERS_HOME=/tmp/aw-smoke node scripts/smoke.mjs codex basic

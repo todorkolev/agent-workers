@@ -78,14 +78,14 @@ verification.
 
 ```bash
 claude
-/plugin marketplace add todorkolev/agentic-workers
+/plugin marketplace add todorkolev/agent-workers
 /plugin install agent-workers@agent-workers
 ```
 
 **Codex**
 
 ```bash
-codex plugin marketplace add todorkolev/agentic-workers
+codex plugin marketplace add todorkolev/agent-workers
 codex plugin add agent-workers@agent-workers
 ```
 

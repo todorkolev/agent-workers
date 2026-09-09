@@ -6,8 +6,8 @@
       "name": "agent-workers",
       "description": "Persistent, interactive Claude and Codex workers you can talk to while they work - from Claude Code or from Codex.",
       "source": "./plugins/agent-workers",
-      "homepage": "https://github.com/todorkolev/agentic-workers",
-      "repository": "https://github.com/todorkolev/agentic-workers",
+      "homepage": "https://github.com/todorkolev/agent-workers",
+      "repository": "https://github.com/todorkolev/agent-workers",
       "license": "MIT",
       "category": "Developer Tools"
     }

@@ -4,12 +4,11 @@
   "version": "0.1.0",
   "description": "Persistent, interactive Claude and Codex workers, driven through one MCP tool contract.",
   "author": { "name": "Todor Kolev" },
-  "homepage": "https://github.com/todorkolev/agentic-workers",
-  "repository": "https://github.com/todorkolev/agentic-workers",
+  "homepage": "https://github.com/todorkolev/agent-workers",
+  "repository": "https://github.com/todorkolev/agent-workers",
   "license": "MIT",
   "keywords": ["agents", "workers", "codex", "claude", "delegation", "mcp"],
   "skills": "./skills",
   "commands": "./commands",
-  "agents": "./agents",
   "mcpServers": "./.mcp.json"
 }
