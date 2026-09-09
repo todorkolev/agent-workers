@@ -154,10 +154,19 @@ restart of your own editor does not cost you control.
 ## Model or effort was rejected
 
 The value is forwarded verbatim and the backend validates it — the error text is
-the backend's own. Claude's `--effort` currently accepts
-`low, medium, high, xhigh, max`; Codex accepts any string its config layer
-allows. `worker_status` always shows the model that was **actually** used, which
-is the one to trust.
+the backend's own. An invalid model fails visibly: the turn ends with an error,
+and `worker_status` shows it as `last turn error` so an `idle` worker is never
+mistaken for a successful one.
+
+Effort is different, and measured: the Claude CLI does **not** reject an
+unrecognised `--effort`. A worker started with a nonsense effort runs normally,
+presumably at the default, and nothing reports which effort was actually
+applied. `worker_status` shows what was **requested**. If effort matters, use a
+value the CLI documents (`low`, `medium`, `high`, `xhigh`, `max`) — a typo will
+not tell you it was a typo.
+
+`worker_status` always shows the model that was **actually** used, which is the
+one to trust.
 
 ## The output is too big / too small
 

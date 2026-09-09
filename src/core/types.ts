@@ -270,6 +270,12 @@ export type WorkerRecord = {
   updatedAt: string;
   /** Populated when state is `failed`. */
   error?: { message: string; recovery?: string };
+  /**
+   * The most recent turn-level error, even when the worker recovered to `idle`.
+   * A rejected model or a failed turn otherwise looks identical to a clean idle
+   * worker in the state alone.
+   */
+  lastError?: { message: string; ts: string };
   paths: WorkerPaths;
   /** Bridge/supervisor version that produced this record. */
   version: string;

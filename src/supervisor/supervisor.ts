@@ -127,13 +127,15 @@ export class Supervisor {
           : await this.adapter.start(this.sessionOptions());
       this.record.sessionId = info.sessionId;
       if (info.actualModel !== undefined) this.record.actualModel = info.actualModel;
-      await this.setState("idle");
     } catch (err) {
       await this.fail(err, "Check that the provider CLI is installed and logged in in the target environment.");
       return;
     }
 
-    // The initial task is just the first turn on the new session.
+    // The initial task is just the first turn on the new session. The worker
+    // stays `starting` until that turn is under way: publishing `idle` in
+    // between would let a caller waiting for idle return before the task had
+    // even begun, and read an empty journal as though the work were done.
     if (this.spec.task.trim().length > 0) {
       try {
         const delivery = await this.adapter.startTurn(this.spec.task);
@@ -143,6 +145,8 @@ export class Supervisor {
         await this.fail(err);
         return;
       }
+    } else {
+      await this.setState("idle");
     }
 
     process.on("SIGTERM", () => void this.shutdown("stopped"));
@@ -211,6 +215,11 @@ export class Supervisor {
         if (typeof diff === "string") this.latestDiff = diff;
         break;
       }
+      case "error":
+        // Keep it on the record: a turn can fail and still leave the session
+        // usable, and `idle` alone would not tell the manager anything went wrong.
+        if (event.text !== undefined) this.record.lastError = { message: event.text, ts: event.ts };
+        break;
       case "permission_request":
       case "question":
         if (event.requestId !== undefined) {
@@ -254,6 +263,7 @@ export class Supervisor {
     try {
       const result = await this.adapter.startTurn(next.text);
       this.record.turnId = result.turnId;
+      this.record.lastError = undefined;
       this.interruptRequested = false;
       await this.setState("running");
     } catch (err) {
@@ -321,6 +331,8 @@ export class Supervisor {
         ? await this.adapter.steer(text, this.record.turnId)
         : await this.adapter.startTurn(text);
       this.record.turnId = result.turnId ?? this.record.turnId;
+      // A fresh turn supersedes the previous turn's failure.
+      if (!running) this.record.lastError = undefined;
       this.interruptRequested = false;
       await this.setState("running");
       const response: ControlResponse = {

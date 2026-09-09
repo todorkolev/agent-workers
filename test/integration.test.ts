@@ -168,6 +168,8 @@ for (const provider of ["claude", "codex"] as const) {
       });
       assert.equal(started.isError, false, started.text);
       const workerId = idOf(started.text);
+      // waitFor "started" must not have skipped past the opening task.
+      assert.doesNotMatch(started.text, /state idle .* seq 0/);
 
       const first = await readUntil(bridge, workerId, (all) => /OK/.test(all));
       assert.ok(first.hit, first.all);
@@ -446,6 +448,26 @@ describe("two managers at once", () => {
       await restarted.close().catch(() => undefined);
       await bridge.call("worker_stop", { workerId: "survivor", takeover: true });
     }
+  });
+});
+
+describe("waiting", () => {
+  it("waitFor idle means the opening task finished, not that it never started", async () => {
+    // The supervisor briefly has a live session and no turn yet. Publishing
+    // `idle` there would let waitFor: "idle" return an empty journal as if the
+    // work were already done.
+    const started = await bridge.call("worker_start", {
+      provider: "claude",
+      cwd: projectDir,
+      task: "REMEMBER pumice",
+      waitFor: "idle",
+      waitMs: 20000,
+    });
+    assert.equal(started.isError, false, started.text);
+    const workerId = idOf(started.text);
+    const seq = Number(/seq (\d+)/.exec(started.text)?.[1] ?? 0);
+    assert.ok(seq > 0, `worker_start(waitFor: "idle") returned before any work happened:\n${started.text}`);
+    await bridge.call("worker_stop", { workerId });
   });
 });
 

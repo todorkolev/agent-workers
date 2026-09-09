@@ -774,6 +774,7 @@ export async function workerStatus(
     for (const p of r.pending) lines.push(`  ${p.requestId} (${p.kind}): ${p.text}`);
   }
   if (r.error !== undefined) lines.push(`error: ${r.error.message}`);
+  if (r.lastError !== undefined) lines.push(`last turn error (${r.lastError.ts}): ${r.lastError.message}`);
   lines.push(`artifacts: ${r.paths.dir}`);
   lines.push("");
   lines.push(renderHint(r));

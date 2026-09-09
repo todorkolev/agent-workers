@@ -134,7 +134,10 @@ export function renderHint(record: WorkerRecord): string {
     case "running":
       return `Still working. worker_wait(workerId="${record.workerId}", cursor=…) blocks until there is something new.`;
     case "idle":
-      return `Idle with its context intact. worker_send(workerId="${record.workerId}", text=…) starts the next turn.`;
+      return record.lastError !== undefined
+        ? `Idle, but its last turn failed: ${clip(record.lastError.message, 240)}\n` +
+            "The session is intact - worker_send starts a fresh turn, or start a new worker with different settings."
+        : `Idle with its context intact. worker_send(workerId="${record.workerId}", text=…) starts the next turn.`;
     case "interrupted":
       return `Interrupted; the session is intact. worker_send or worker_resume continues it.`;
     case "orphaned":

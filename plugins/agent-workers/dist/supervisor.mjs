@@ -1326,7 +1326,6 @@ var Supervisor = class {
       const info = this.spec.resumeSessionId !== void 0 ? await this.adapter.resume(this.spec.resumeSessionId, this.sessionOptions()) : await this.adapter.start(this.sessionOptions());
       this.record.sessionId = info.sessionId;
       if (info.actualModel !== void 0) this.record.actualModel = info.actualModel;
-      await this.setState("idle");
     } catch (err) {
       await this.fail(err, "Check that the provider CLI is installed and logged in in the target environment.");
       return;
@@ -1340,6 +1339,8 @@ var Supervisor = class {
         await this.fail(err);
         return;
       }
+    } else {
+      await this.setState("idle");
     }
     process.on("SIGTERM", () => void this.shutdown("stopped"));
     process.on("SIGINT", () => void this.shutdown("stopped"));
@@ -1397,6 +1398,9 @@ var Supervisor = class {
         if (typeof diff === "string") this.latestDiff = diff;
         break;
       }
+      case "error":
+        if (event.text !== void 0) this.record.lastError = { message: event.text, ts: event.ts };
+        break;
       case "permission_request":
       case "question":
         if (event.requestId !== void 0) {
@@ -1436,6 +1440,7 @@ var Supervisor = class {
     try {
       const result = await this.adapter.startTurn(next.text);
       this.record.turnId = result.turnId;
+      this.record.lastError = void 0;
       this.interruptRequested = false;
       await this.setState("running");
     } catch (err) {
@@ -1500,6 +1505,7 @@ var Supervisor = class {
       const running = this.record.state === "running";
       const result = running ? await this.adapter.steer(text, this.record.turnId) : await this.adapter.startTurn(text);
       this.record.turnId = result.turnId ?? this.record.turnId;
+      if (!running) this.record.lastError = void 0;
       this.interruptRequested = false;
       await this.setState("running");
       const response = {

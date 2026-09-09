@@ -22106,7 +22106,8 @@ function renderHint(record2) {
     case "running":
       return `Still working. worker_wait(workerId="${record2.workerId}", cursor=\u2026) blocks until there is something new.`;
     case "idle":
-      return `Idle with its context intact. worker_send(workerId="${record2.workerId}", text=\u2026) starts the next turn.`;
+      return record2.lastError !== void 0 ? `Idle, but its last turn failed: ${clip(record2.lastError.message, 240)}
+The session is intact - worker_send starts a fresh turn, or start a new worker with different settings.` : `Idle with its context intact. worker_send(workerId="${record2.workerId}", text=\u2026) starts the next turn.`;
     case "interrupted":
       return `Interrupted; the session is intact. worker_send or worker_resume continues it.`;
     case "orphaned":
@@ -22648,6 +22649,7 @@ async function workerStatus(_ctx, input) {
     for (const p of r.pending) lines.push(`  ${p.requestId} (${p.kind}): ${p.text}`);
   }
   if (r.error !== void 0) lines.push(`error: ${r.error.message}`);
+  if (r.lastError !== void 0) lines.push(`last turn error (${r.lastError.ts}): ${r.lastError.message}`);
   lines.push(`artifacts: ${r.paths.dir}`);
   lines.push("");
   lines.push(renderHint(r));

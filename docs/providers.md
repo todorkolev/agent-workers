@@ -123,10 +123,21 @@ Read-only workers additionally get `--disallowedTools Write Edit NotebookEdit`.
 
 ### Effort and model
 
-Both are forwarded verbatim. `--effort` currently advertises
-`low, medium, high, xhigh, max`; the CLI validates, so an unknown value fails
-loudly instead of being silently capped. `system/init.model` is the model that
-was really used and is what `worker_status` reports.
+Both are forwarded verbatim, and neither is checked against a list here — that
+is how a perfectly valid `max` ends up silently downgraded.
+
+Measured, and worth knowing: `--effort` advertises
+`low, medium, high, xhigh, max`, but an unrecognised value is **not** rejected.
+A worker started with `--effort not-an-effort` ran a normal turn to completion.
+So an invalid effort is quietly ignored by the CLI rather than failing, and
+there is no field that reports the effort actually applied. `worker_status`
+shows the effort that was **requested**; treat it as a request, not a receipt.
+
+An invalid **model** does fail, and visibly — the turn ends with an error the
+manager can read.
+
+`system/init.model` is the model that was really used and is what
+`worker_status` reports as "actually used".
 
 ---
 
@@ -214,6 +225,20 @@ From the bindings the installed CLI generates
 | `account/chatgptAuthTokens/refresh`, `attestation/generate` | infrastructure; answered with a JSON-RPC error |
 
 Never leave a server request unanswered: the worker stalls until it gets a reply.
+
+### Invalid model, measured
+
+Codex rejects an unknown model with a clear error rather than substituting one:
+
+```
+[1] turn started
+[2] ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",
+     "message":"The 'definitely-not-a-model-xyz' model is not supported when using Codex with a ChatGPT account."}}
+[3] turn failed
+```
+
+The worker stays usable afterwards; the failure is recorded on the worker as
+`last turn error` so `idle` is never mistaken for success.
 
 ### Enums, as generated
 
