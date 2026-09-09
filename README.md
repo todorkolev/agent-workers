@@ -102,7 +102,10 @@ workers off your subscription onto paid API billing.
 
 ## Writing code safely
 
-Give any worker with `writeAccess: true` its own git worktree:
+A worker with `writeAccess: true` **must** be isolated - `worktree: true` or an
+explicit `worktreePath`. Omitting it is refused rather than quietly pointed at
+your own checkout; to write directly into a directory you have to say
+`allowMainCheckout: true` and mean it.
 
 ```
 worker_start(provider="claude", model="opus", effort="max",
@@ -113,8 +116,12 @@ worker_start(provider="claude", model="opus", effort="max",
 
 It works in `.worktrees/aw-<workerId>` on branch `agent/<workerId>`, cut from
 the exact base you gave. Your main checkout is never touched — not even by an
-untracked `.worktrees/` entry, which is added to `.git/info/exclude`. Two live
-writers in one directory are refused outright.
+untracked `.worktrees/` entry, which is added to `.git/info/exclude`.
+
+Two live writers can never share a directory. The check is an atomic lock keyed
+by the canonical path, so a race between two `worker_start` calls has exactly
+one winner, and `/repo` versus `/repo/src` versus a symlink alias all count as
+the same target.
 
 Already made the worktree yourself? Pass `worktreePath` (and `branch`) and it is
 adopted as-is rather than recreated.

@@ -223,8 +223,16 @@ export class ClaudeCliAdapter implements ProviderAdapter {
       for (const cb of this.exitCbs) cb({ code, signal });
     });
 
-    readline.createInterface({ input: child.stdout }).on("line", (line) => this.onStdoutLine(line));
-    readline.createInterface({ input: child.stderr }).on("line", (line) => {
+    // A pipe that closes under us emits an asynchronous 'error'. Unhandled,
+    // that is an uncaught exception which kills the supervisor before it can
+    // record why the worker died.
+    child.stdin.on("error", (err) => log.warn("claude stdin error:", err));
+    const outReader = readline.createInterface({ input: child.stdout });
+    outReader.on("error", (err) => log.warn("claude stdout error:", err));
+    outReader.on("line", (line) => this.onStdoutLine(line));
+    const errReader = readline.createInterface({ input: child.stderr });
+    errReader.on("error", (err) => log.warn("claude stderr error:", err));
+    errReader.on("line", (line) => {
       if (line.length === 0) return;
       for (const cb of this.stderrCbs) cb(line);
     });

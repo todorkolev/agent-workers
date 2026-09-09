@@ -1,10 +1,42 @@
 #!/usr/bin/env node
+var __defProp = Object.defineProperty;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
 
 // src/core/store.ts
+var store_exports = {};
+__export(store_exports, {
+  acquireSupervisorLock: () => acquireSupervisorLock,
+  acquireWriteLock: () => acquireWriteLock,
+  appendLine: () => appendLine,
+  appendText: () => appendText,
+  canonical: () => canonical,
+  ensureDirs: () => ensureDirs,
+  listWorkerIds: () => listWorkerIds,
+  pidAlive: () => pidAlive,
+  purgeWorker: () => purgeWorker,
+  readJson: () => readJson,
+  readJsonSync: () => readJsonSync,
+  readRecord: () => readRecord,
+  readSince: () => readSince,
+  socketDir: () => socketDir,
+  stateDir: () => stateDir,
+  supervisorAlive: () => supervisorAlive,
+  workerDir: () => workerDir,
+  workerPaths: () => workerPaths,
+  writeJsonAtomic: () => writeJsonAtomic
+});
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as readline from "node:readline";
 import { createHash } from "node:crypto";
 function stateDir() {
   const fromEnv = process.env["AGENT_WORKERS_HOME"];
@@ -41,7 +73,6 @@ async function ensureDirs(workerId) {
   await fsp.mkdir(socketDir(), { recursive: true, mode: 448 });
   if (workerId !== void 0) await fsp.mkdir(workerDir(workerId), { recursive: true });
 }
-var tmpCounter = 0;
 async function writeJsonAtomic(file, value) {
   tmpCounter += 1;
   const tmp = `${file}.${process.pid}.${tmpCounter}.${Math.random().toString(36).slice(2, 8)}.tmp`;
@@ -89,6 +120,47 @@ function appendText(file, text) {
   } catch {
   }
 }
+async function readSince(file, sinceSeq, maxEntries) {
+  const entries = [];
+  let more = false;
+  let stream;
+  try {
+    stream = fs.createReadStream(file, { encoding: "utf8" });
+  } catch {
+    return { entries, more };
+  }
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (line.length === 0) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof parsed.seq !== "number" || parsed.seq <= sinceSeq) continue;
+      if (entries.length >= maxEntries) {
+        more = true;
+        break;
+      }
+      entries.push(parsed);
+    }
+  } catch {
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+  return { entries, more };
+}
+async function listWorkerIds() {
+  try {
+    const dirents = await fsp.readdir(path.join(stateDir(), "workers"), { withFileTypes: true });
+    return dirents.filter((d) => d.isDirectory()).map((d) => d.name).sort();
+  } catch {
+    return [];
+  }
+}
 async function readRecord(workerId) {
   return readJson(workerPaths(workerId).record);
 }
@@ -101,14 +173,37 @@ function pidAlive(pid) {
     return err.code === "EPERM";
   }
 }
-function lockPath(writeDir) {
-  const hash = createHash("sha256").update(path.resolve(writeDir)).digest("hex").slice(0, 20);
+function supervisorAlive(pid, workerId) {
+  if (!pidAlive(pid)) return false;
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+    if (cmdline.length === 0) return true;
+    return cmdline.includes(`agent-worker:${workerId}`) || cmdline.includes(workerId);
+  } catch {
+    return true;
+  }
+}
+async function canonical(p) {
+  try {
+    return await fsp.realpath(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+function lockPath(canonicalDir) {
+  const hash = createHash("sha256").update(canonicalDir).digest("hex").slice(0, 20);
   return path.join(stateDir(), "locks", `${hash}.lock`);
 }
 async function acquireWriteLock(writeDir, workerId) {
-  const file = lockPath(writeDir);
+  return acquireLock(lockPath(await canonical(writeDir)), workerId, await canonical(writeDir));
+}
+async function acquireSupervisorLock(workerId) {
+  const file = path.join(stateDir(), "locks", `supervisor-${createHash("sha256").update(workerId).digest("hex").slice(0, 20)}.lock`);
+  return acquireLock(file, workerId, workerId);
+}
+async function acquireLock(file, workerId, subject) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
-  const payload = JSON.stringify({ workerId, pid: process.pid, dir: path.resolve(writeDir), at: (/* @__PURE__ */ new Date()).toISOString() });
+  const payload = JSON.stringify({ workerId, pid: process.pid, subject, at: (/* @__PURE__ */ new Date()).toISOString() });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const handle = await fsp.open(file, "wx");
@@ -118,14 +213,30 @@ async function acquireWriteLock(writeDir, workerId) {
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
       const held = await readJson(file);
-      if (held !== void 0 && held.workerId !== workerId && pidAlive(held.pid)) {
+      if (held !== void 0 && pidAlive(held.pid) && held.pid !== process.pid) {
+        if (held.workerId !== workerId) return { heldBy: held };
         return { heldBy: held };
       }
       await fsp.rm(file, { force: true });
     }
   }
-  throw new Error(`could not acquire the write lock for ${writeDir}`);
+  throw new Error(`could not acquire the lock for ${subject}`);
 }
+async function purgeWorker(workerId) {
+  const paths = workerPaths(workerId);
+  await fsp.rm(paths.dir, { recursive: true, force: true });
+  await fsp.rm(paths.socket, { force: true });
+}
+var tmpCounter;
+var init_store = __esm({
+  "src/core/store.ts"() {
+    "use strict";
+    tmpCounter = 0;
+  }
+});
+
+// src/supervisor/main.ts
+init_store();
 
 // src/core/logger.ts
 var ORDER = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -159,15 +270,16 @@ function createLogger(scope) {
 }
 
 // src/supervisor/supervisor.ts
+init_store();
 import * as fsp2 from "node:fs/promises";
 
 // src/core/control.ts
 import * as net from "node:net";
-import * as readline from "node:readline";
+import * as readline2 from "node:readline";
 async function serveControl(socketPath, handler) {
   await removeStaleSocket(socketPath);
   const server = net.createServer((socket) => {
-    const rl = readline.createInterface({ input: socket });
+    const rl = readline2.createInterface({ input: socket });
     rl.on("error", () => socket.destroy());
     rl.on("line", (line) => {
       void (async () => {
@@ -277,7 +389,7 @@ async function summarizeWork(dir, base) {
 
 // src/providers/claude/adapter.ts
 import { spawn } from "node:child_process";
-import * as readline2 from "node:readline";
+import * as readline3 from "node:readline";
 import { randomUUID } from "node:crypto";
 var log = createLogger("claude-adapter");
 function rec(value) {
@@ -402,8 +514,13 @@ var ClaudeCliAdapter = class {
       this.ready?.reject(new Error(`claude CLI exited before it was ready (code=${code} signal=${signal})`));
       for (const cb of this.exitCbs) cb({ code, signal });
     });
-    readline2.createInterface({ input: child.stdout }).on("line", (line) => this.onStdoutLine(line));
-    readline2.createInterface({ input: child.stderr }).on("line", (line) => {
+    child.stdin.on("error", (err) => log.warn("claude stdin error:", err));
+    const outReader = readline3.createInterface({ input: child.stdout });
+    outReader.on("error", (err) => log.warn("claude stdout error:", err));
+    outReader.on("line", (line) => this.onStdoutLine(line));
+    const errReader = readline3.createInterface({ input: child.stderr });
+    errReader.on("error", (err) => log.warn("claude stderr error:", err));
+    errReader.on("line", (line) => {
       if (line.length === 0) return;
       for (const cb of this.stderrCbs) cb(line);
     });
@@ -778,7 +895,7 @@ var ClaudeCliAdapter = class {
 
 // src/providers/codex/adapter.ts
 import { spawn as spawn2 } from "node:child_process";
-import * as readline3 from "node:readline";
+import * as readline4 from "node:readline";
 var log2 = createLogger("codex-adapter");
 function rec2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
@@ -789,6 +906,10 @@ function str2(value) {
 function textInput(text) {
   return [{ type: "text", text, text_elements: [] }];
 }
+var delay = (ms) => new Promise((resolve2) => {
+  const t = setTimeout(resolve2, ms);
+  t.unref?.();
+});
 function firstLine2(text, max = 220) {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}\u2026` : flat;
@@ -877,8 +998,13 @@ var CodexAppServerAdapter = class {
       this.failAll(new Error(`codex app-server exited (code=${code} signal=${signal})`));
       for (const cb of this.exitCbs) cb({ code, signal });
     });
-    readline3.createInterface({ input: child.stdout }).on("line", (line) => this.onStdoutLine(line));
-    readline3.createInterface({ input: child.stderr }).on("line", (line) => {
+    child.stdin.on("error", (err) => log2.warn("codex stdin error:", err));
+    const outReader = readline4.createInterface({ input: child.stdout });
+    outReader.on("error", (err) => log2.warn("codex stdout error:", err));
+    outReader.on("line", (line) => this.onStdoutLine(line));
+    const errReader = readline4.createInterface({ input: child.stderr });
+    errReader.on("error", (err) => log2.warn("codex stderr error:", err));
+    errReader.on("line", (line) => {
       if (line.length === 0) return;
       for (const cb of this.stderrCbs) cb(line);
     });
@@ -957,11 +1083,12 @@ var CodexAppServerAdapter = class {
     if (threadId === void 0 || turnId === void 0) return;
     const ended = this.waitForTurnEnd();
     try {
-      await this.request("turn/interrupt", { threadId, turnId });
+      await this.request("turn/interrupt", { threadId, turnId }, 3e4);
     } catch (err) {
       log2.warn("turn/interrupt rejected:", err);
     }
-    await ended;
+    await Promise.race([ended, delay(3e4)]);
+    this._turnId = void 0;
   }
   /** Answer a parked approval / user-input request with the manager's decision. */
   async respond(requestId, decision) {
@@ -986,7 +1113,7 @@ var CodexAppServerAdapter = class {
       case "userInput": {
         const answers = {};
         for (const qid of parked.questionIds ?? []) {
-          answers[qid] = { type: "text", text: decision.text ?? "" };
+          answers[qid] = { answers: [decision.text ?? ""] };
         }
         this.write({ id: parked.id, result: { answers } });
         return;
@@ -1021,14 +1148,38 @@ var CodexAppServerAdapter = class {
     if (threadId === void 0) throw new Error("no codex thread; start() was not called");
     return threadId;
   }
-  request(method, params) {
+  /**
+   * Send a JSON-RPC request and await its response.
+   *
+   * The timeout is not optional politeness: a reply that is malformed, carries
+   * an unknown id, or never arrives would otherwise leave the promise pending
+   * forever - wedging the worker in `starting`, or leaving a turn that can
+   * never be steered or interrupted.
+   */
+  request(method, params, timeoutMs = 12e4) {
     if (this.exitError) return Promise.reject(this.exitError);
     const id = this.nextId++;
     return new Promise((resolve2, reject) => {
-      this.pending.set(id, { resolve: resolve2, reject, method });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`codex ${method} did not answer within ${Math.round(timeoutMs / 1e3)}s`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve2(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+        method
+      });
       try {
         this.write({ jsonrpc: "2.0", id, method, params });
       } catch (err) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -1206,7 +1357,9 @@ var CodexAppServerAdapter = class {
           data: { willRetry }
         });
         if (!willRetry) {
+          this.emit({ ts, type: "turn_completed", rawType: method, text: "turn failed", ...withTurn, data: { status: "failed" } });
           this._turnId = void 0;
+          this.lastAgentMessage = void 0;
           this.resolveTurnEnd();
         }
         return;
@@ -1298,6 +1451,16 @@ function describeApproval(kind, params) {
 
 // src/supervisor/supervisor.ts
 var log3 = createLogger("supervisor");
+async function lastJournalSeq(file) {
+  const { readSince: readSince2 } = await Promise.resolve().then(() => (init_store(), store_exports));
+  let highest = 0;
+  for (; ; ) {
+    const { entries, more } = await readSince2(file, highest, 5e3);
+    if (entries.length === 0) return highest;
+    highest = entries[entries.length - 1]?.seq ?? highest;
+    if (!more) return highest;
+  }
+}
 var Supervisor = class {
   spec;
   adapter;
@@ -1317,6 +1480,8 @@ var Supervisor = class {
   writeChain = Promise.resolve();
   /** Held for the lifetime of a write worker; see {@link acquireWriteLock}. */
   writeLock;
+  /** Held for this process's whole life: exactly one supervisor per worker. */
+  supervisorLock;
   constructor(spec) {
     this.spec = spec;
     this.adapter = spec.provider === "claude" ? new ClaudeCliAdapter() : new CodexAppServerAdapter();
@@ -1348,13 +1513,26 @@ var Supervisor = class {
     await ensureDirs(this.spec.workerId);
     const prior = await readRecord(this.spec.workerId);
     if (prior !== void 0) {
-      this.seq = prior.lastSeq;
-      this.record.lastSeq = prior.lastSeq;
+      const journalSeq = await lastJournalSeq(this.record.paths.journal);
+      this.seq = Math.max(prior.lastSeq, journalSeq);
+      this.record.lastSeq = this.seq;
       this.record.createdAt = prior.createdAt;
       if (this.record.actualModel === void 0 && prior.actualModel !== void 0) {
         this.record.actualModel = prior.actualModel;
       }
+      this.queued.push(...prior.queued ?? []);
+      const snapshot = await readJson(this.record.paths.result);
+      if (snapshot !== void 0) {
+        this.lastFinal = snapshot.final;
+        for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
+      }
     }
+    const own = await acquireSupervisorLock(this.spec.workerId);
+    if ("heldBy" in own) {
+      log3.error(`another supervisor (pid ${own.heldBy.pid}) already owns worker ${this.spec.workerId}`);
+      process.exit(3);
+    }
+    this.supervisorLock = own.lock;
     if (this.spec.writeAccess) {
       const dir = this.spec.worktree?.path ?? this.spec.cwd;
       const claim = await acquireWriteLock(dir, this.spec.workerId);
@@ -1484,6 +1662,7 @@ var Supervisor = class {
   /** Deliver anything the manager sent while the worker was blocked. */
   async drainQueue() {
     const next = this.queued.shift();
+    this.record.queued = [...this.queued];
     if (next === void 0) return;
     try {
       const result = await this.adapter.startTurn(next.text);
@@ -1541,6 +1720,8 @@ var Supervisor = class {
     }
     if (this.record.state === "blocked") {
       this.queued.push({ text, at: (/* @__PURE__ */ new Date()).toISOString() });
+      this.record.queued = [...this.queued];
+      await this.persist();
       return {
         ok: true,
         op: "send",
@@ -1710,9 +1891,11 @@ var Supervisor = class {
   async teardown() {
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
-    try {
-      await this.writeLock?.release();
-    } catch {
+    for (const lock of [this.writeLock, this.supervisorLock]) {
+      try {
+        await lock?.release();
+      } catch {
+      }
     }
     try {
       await this.adapter.dispose();

@@ -21580,6 +21580,23 @@ function pidAlive(pid) {
     return err.code === "EPERM";
   }
 }
+function supervisorAlive(pid, workerId) {
+  if (!pidAlive(pid)) return false;
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+    if (cmdline.length === 0) return true;
+    return cmdline.includes(`agent-worker:${workerId}`) || cmdline.includes(workerId);
+  } catch {
+    return true;
+  }
+}
+async function canonical(p) {
+  try {
+    return await fsp.realpath(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
 async function purgeWorker(workerId) {
   const paths = workerPaths(workerId);
   await fsp.rm(paths.dir, { recursive: true, force: true });
@@ -21765,9 +21782,15 @@ async function ensureWorktree(req) {
   if (baseSha === void 0) {
     throw new Error(`git base "${baseRef}" does not resolve to a commit in ${repo}`);
   }
+  const primary = await primaryWorktree(repo);
+  if (primary !== void 0 && path3.resolve(primary) === dir) {
+    throw new Error(
+      `${dir} is the repository's main checkout, not an isolated worktree. Omit worktreePath to get a dedicated one, or point it somewhere else.`
+    );
+  }
   const existing = await worktreeAt(repo, dir);
   if (existing !== void 0) {
-    return { path: dir, branch: existing, base: baseSha, created: false };
+    return { path: dir, branch: existing.branch, base: baseSha, created: false };
   }
   const dirExists = await pathExists(dir);
   if (dirExists) {
@@ -21816,12 +21839,26 @@ ${entry}
 async function worktreeAt(repo, dir) {
   const res = await git(repo, ["worktree", "list", "--porcelain"]);
   if (res.code !== 0) return void 0;
+  const target = path3.resolve(dir);
   let current;
   for (const line of res.stdout.split("\n")) {
-    if (line.startsWith("worktree ")) current = path3.resolve(line.slice("worktree ".length).trim());
-    else if (line.startsWith("branch ") && current === path3.resolve(dir)) {
-      return line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+    if (line.startsWith("worktree ")) {
+      current = path3.resolve(line.slice("worktree ".length).trim());
+      continue;
     }
+    if (current !== target) continue;
+    if (line.startsWith("branch ")) {
+      return { branch: line.slice("branch ".length).trim().replace(/^refs\/heads\//, "") };
+    }
+    if (line.trim() === "detached") return { branch: "(detached)" };
+  }
+  return void 0;
+}
+async function primaryWorktree(repo) {
+  const res = await git(repo, ["worktree", "list", "--porcelain"]);
+  if (res.code !== 0) return void 0;
+  for (const line of res.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) return line.slice("worktree ".length).trim();
   }
   return void 0;
 }
@@ -21915,7 +21952,7 @@ var log = createLogger("registry");
 async function resolveWorker(workerId) {
   const record2 = await readRecord(workerId);
   if (record2 === void 0) return void 0;
-  const alive = pidAlive(record2.supervisorPid);
+  const alive = supervisorAlive(record2.supervisorPid, record2.workerId);
   if (!alive && isLiveState(record2.state)) {
     return { record: { ...record2, state: "orphaned" }, alive: false };
   }
@@ -21929,15 +21966,19 @@ async function listWorkers() {
 async function listLiveWorkers() {
   return (await listWorkers()).filter((w) => w.alive && isLiveState(w.record.state));
 }
-function writeTarget(record2) {
-  return path4.resolve(record2.worktree?.path ?? record2.cwd);
+async function writeTarget(record2) {
+  return canonical(record2.worktree?.path ?? record2.cwd);
+}
+function overlaps(a, b) {
+  if (a === b) return true;
+  return a.startsWith(`${b}${path4.sep}`) || b.startsWith(`${a}${path4.sep}`);
 }
 async function findWriteConflict(dir, exceptWorkerId) {
-  const target = path4.resolve(dir);
+  const target = await canonical(dir);
   for (const worker of await listLiveWorkers()) {
     if (!worker.record.writeAccess) continue;
     if (worker.record.workerId === exceptWorkerId) continue;
-    if (writeTarget(worker.record) === target) return worker.record;
+    if (overlaps(await writeTarget(worker.record), target)) return worker.record;
   }
   return void 0;
 }
@@ -21984,12 +22025,12 @@ async function waitForSupervisor(workerId, timeoutMs, expectedPid) {
       const isOurs = expectedPid === void 0 || current.record.supervisorPid === expectedPid;
       if (isOurs) {
         last = current;
-        if (current.record.state !== "starting") return current;
+        if (current.record.state !== "starting") return { ...current, confirmed: true };
       }
     }
     await delay(120);
   }
-  return last;
+  return last === void 0 ? void 0 : { ...last, confirmed: false };
 }
 async function waitForWorker(workerId, opts) {
   const deadline = Date.now() + opts.timeoutMs;
@@ -21997,7 +22038,11 @@ async function waitForWorker(workerId, opts) {
   for (; ; ) {
     const worker = await resolveWorker(workerId);
     if (worker === void 0) return { worker: void 0, reason: "gone" };
-    if (opts.sinceSeq !== void 0 && worker.record.lastSeq > opts.sinceSeq) return { worker, reason: "event" };
+    if (opts.sinceSeq !== void 0 && worker.record.lastSeq > opts.sinceSeq) {
+      if (opts.messagesOnly !== true) return { worker, reason: "event" };
+      const { entries } = await readSince(worker.record.paths.journal, opts.sinceSeq, 200);
+      if (entries.some((e) => HIGH_SIGNAL_EVENTS.includes(e.type))) return { worker, reason: "event" };
+    }
     if (states.size > 0 && states.has(worker.record.state)) return { worker, reason: "state" };
     if (!worker.alive && !isLiveState(worker.record.state)) return { worker, reason: "state" };
     if (Date.now() >= deadline) return { worker, reason: "timeout" };
@@ -22173,6 +22218,9 @@ var startSchema = {
   effort: external_exports.string().optional().describe("Reasoning effort, forwarded verbatim (e.g. 'high', 'max'). The backend validates it."),
   cwd: external_exports.string().optional().describe("Working directory. Defaults to the manager's project directory."),
   writeAccess: external_exports.boolean().optional().describe("Allow the worker to edit files. Default false (read-only)."),
+  allowMainCheckout: external_exports.boolean().optional().describe(
+    "Permit a write worker to edit the directory directly instead of an isolated worktree. Off by default: without it, writeAccess requires worktree or worktreePath, so a worker never edits your own checkout by omission."
+  ),
   worktree: external_exports.boolean().optional().describe("Run in a dedicated git worktree. Strongly recommended with writeAccess."),
   worktreePath: external_exports.string().optional().describe("Use this worktree directory. An existing one is adopted, not recreated."),
   branch: external_exports.string().optional().describe("Branch for the worktree. Default agent/<workerId>."),
@@ -22300,6 +22348,12 @@ ${availability.recovery ?? ""}`.trim());
     }
   }
   const writeAccess = input.writeAccess ?? false;
+  const isolated = input.worktree === true || input.worktreePath !== void 0 || input.branch !== void 0;
+  if (writeAccess && !isolated && input.allowMainCheckout !== true) {
+    return fail(
+      "A write worker needs its own worktree: pass worktree: true (or worktreePath). To let it edit this directory directly - including your main checkout - pass allowMainCheckout: true and say so deliberately."
+    );
+  }
   let worktree;
   let effectiveCwd = cwd;
   if (input.worktree === true || input.worktreePath !== void 0 || input.branch !== void 0) {
@@ -22322,7 +22376,7 @@ ${availability.recovery ?? ""}`.trim());
     }
   }
   if (writeAccess) {
-    const conflict = await findWriteConflict(effectiveCwd, workerId);
+    const conflict = await findWriteConflict(await canonical(effectiveCwd), workerId);
     if (conflict !== void 0) {
       return fail(
         `Worker "${conflict.workerId}" (${conflict.provider}, ${conflict.state}) is already writing in ${effectiveCwd}. Give this worker its own worktree, or stop that one first.`
@@ -22374,7 +22428,7 @@ ${availability.recovery ?? ""}`.trim());
     const states = waitFor === "idle" ? ["idle", "blocked", "interrupted", "completed", "failed", "stopped"] : ["blocked", "failed", "stopped"];
     const outcome = await waitForWorker(workerId, {
       timeoutMs: waitMs,
-      ...waitFor === "first_message" ? { sinceSeq: 0 } : {},
+      ...waitFor === "first_message" ? { sinceSeq: 0, messagesOnly: true } : {},
       states
     });
     if (outcome.worker !== void 0) worker = outcome.worker;
@@ -22385,6 +22439,11 @@ ${availability.recovery ?? ""}`.trim());
       `Worker "${workerId}" failed to start: ${record2.error?.message ?? "unknown error"}
 ${record2.error?.recovery ?? ""}
 Logs: ${record2.paths.supervisorLog}`
+    );
+  }
+  if (worker.confirmed === false) {
+    return fail(
+      `Worker "${workerId}" is still starting after ${waitMs}ms and has not established a ${provider} session. Check ${record2.paths.supervisorLog}. If it recovers it will appear in worker_list.`
     );
   }
   const lines = [renderHeader(worker)];
@@ -22465,7 +22524,7 @@ async function workerWait(_ctx, input) {
   const states = until === "idle" ? ["idle", "blocked", "interrupted", "completed", "failed", "stopped", "orphaned"] : until === "end" ? ["completed", "failed", "stopped", "orphaned"] : ["blocked", "failed", "stopped", "orphaned"];
   const outcome = await waitForWorker(input.workerId, {
     timeoutMs,
-    ...until === "message" ? { sinceSeq: input.cursor ?? found.record.lastSeq } : {},
+    ...until === "message" ? { sinceSeq: input.cursor ?? found.record.lastSeq, messagesOnly: true } : {},
     states
   });
   if (outcome.worker === void 0) return fail(`Worker "${input.workerId}" disappeared while waiting.`);
@@ -22534,17 +22593,30 @@ async function workerStop(ctx, input) {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
   if (found.alive) {
-    const response = await callSupervisor(found.record, {
-      op: "stop",
-      owner: owner(ctx),
-      ...input.takeover === true ? { takeover: true } : {}
-    });
-    if (!response.ok && response.code === "not_owner") return controlFailure(found.record, response);
+    const response = await callSupervisor(
+      found.record,
+      { op: "stop", owner: owner(ctx), ...input.takeover === true ? { takeover: true } : {} },
+      9e4
+    );
+    if (!response.ok) {
+      return controlFailure(found.record, response);
+    }
   } else if (input.purge !== true) {
     const stopped = { ...found.record, state: "stopped", updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
     await writeJsonAtomic(found.record.paths.record, stopped).catch(() => void 0);
   }
   if (input.purge === true) {
+    for (let i = 0; i < 40; i += 1) {
+      const still2 = await resolveWorker(input.workerId);
+      if (still2 === void 0 || !still2.alive) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const still = await resolveWorker(input.workerId);
+    if (still !== void 0 && still.alive) {
+      return fail(
+        `Worker "${input.workerId}" is still running (pid ${still.record.supervisorPid}); nothing was deleted. Try worker_stop again, or kill that process first.`
+      );
+    }
     await purgeWorker(input.workerId);
     return ok(`Worker "${input.workerId}" was stopped and its artifacts deleted.`);
   }
@@ -22560,6 +22632,15 @@ async function workerStop(ctx, input) {
 async function workerRespond(ctx, input) {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
+  const pending = found.record.pending.find((p) => p.requestId === input.requestId);
+  if (pending?.kind === "permission" && input.decision === "answer") {
+    return fail(
+      `"${input.requestId}" is a permission request, not a question. Answer it with decision: "allow" or decision: "deny" (text is kept as the reason).`
+    );
+  }
+  if (pending?.kind === "question" && input.decision === "allow" && input.text === void 0) {
+    return fail(`"${input.requestId}" is a question. Answer it with decision: "answer" and the text.`);
+  }
   const response = await callSupervisor(found.record, {
     op: "respond",
     requestId: input.requestId,
@@ -22628,6 +22709,11 @@ async function workerResume(ctx, input) {
     return fail(
       `Resume failed: ${worker.record.error?.message ?? "unknown error"}
 Logs: ${worker.record.paths.supervisorLog}`
+    );
+  }
+  if (worker.confirmed === false) {
+    return fail(
+      `The resumed supervisor for "${input.workerId}" is still starting and has not reattached to the ${record2.provider} session yet. Check ${worker.record.paths.supervisorLog}, then try again.`
     );
   }
   return ok(

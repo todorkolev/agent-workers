@@ -160,6 +160,9 @@ async function scenarioSteer() {
       "Run these shell commands one at a time, in order: (1) sleep 10; echo AAA  (2) sleep 10; echo BBB  " +
       "(3) sleep 10; echo CCC. Report what each printed.",
     writeAccess: true,
+    // A scratch directory that is not a git repository, so isolation is opted
+    // out of deliberately rather than by omission.
+    allowMainCheckout: true,
     allowedTools: ["Bash"],
     permissionMode: provider === "claude" ? "acceptEdits" : "never",
     transcriptMode: "activity",
@@ -298,7 +301,9 @@ async function scenarioWorktree() {
   const conflict = await call("worker_start", {
     provider,
     workerId: `${workerId}-conflict`,
-    cwd: path.join(repo, ".worktrees", `aw-${workerId}`),
+    cwd: repo,
+    worktreePath: path.join(repo, ".worktrees", `aw-${workerId}`),
+    branch: `agent/${workerId}`,
     writeAccess: true,
     task: "do nothing",
   });

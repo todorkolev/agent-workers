@@ -20,14 +20,16 @@ import { fileURLToPath } from "node:url";
 import { controlRequest } from "../core/control.ts";
 import { createLogger } from "../core/logger.ts";
 import {
+  canonical,
   ensureDirs,
   listWorkerIds,
-  pidAlive,
   readRecord,
+  readSince,
+  supervisorAlive,
   workerPaths,
   writeJsonAtomic,
 } from "../core/store.ts";
-import { isLiveState, type WorkerRecord } from "../core/types.ts";
+import { HIGH_SIGNAL_EVENTS, isLiveState, type WorkerEvent, type WorkerRecord } from "../core/types.ts";
 import type { SupervisorSpec } from "../supervisor/spec.ts";
 
 const log = createLogger("registry");
@@ -35,8 +37,13 @@ const log = createLogger("registry");
 /** A record together with the truth about whether its process is still there. */
 export type ResolvedWorker = {
   record: WorkerRecord;
-  /** The supervisor process is alive. */
+  /** The supervisor process is alive AND is this worker's supervisor. */
   alive: boolean;
+  /**
+   * Set by {@link waitForSupervisor}: false means the deadline passed while the
+   * worker was still `starting`, so nothing about it has been confirmed.
+   */
+  confirmed?: boolean;
 };
 
 /**
@@ -48,7 +55,9 @@ export type ResolvedWorker = {
 export async function resolveWorker(workerId: string): Promise<ResolvedWorker | undefined> {
   const record = await readRecord(workerId);
   if (record === undefined) return undefined;
-  const alive = pidAlive(record.supervisorPid);
+  // Identity, not just liveness: a recycled pid would otherwise keep a dead
+  // worker reporting as running indefinitely.
+  const alive = supervisorAlive(record.supervisorPid, record.workerId);
   if (!alive && isLiveState(record.state)) {
     return { record: { ...record, state: "orphaned" }, alive: false };
   }
@@ -73,17 +82,30 @@ export async function listLiveWorkers(): Promise<ResolvedWorker[]> {
  * The directory a worker actually writes into. Two live write workers may never
  * share one, which is the whole point of the worktree machinery.
  */
-export function writeTarget(record: WorkerRecord): string {
-  return path.resolve(record.worktree?.path ?? record.cwd);
+export async function writeTarget(record: WorkerRecord): Promise<string> {
+  return canonical(record.worktree?.path ?? record.cwd);
 }
 
-/** The live write worker already owning `dir`, if any. */
+/** True when either path contains the other - they are the same write target. */
+function overlaps(a: string, b: string): boolean {
+  if (a === b) return true;
+  return a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`);
+}
+
+/**
+ * The live write worker already owning `dir`, if any.
+ *
+ * Overlap rather than equality: a worker editing `/repo` and one editing
+ * `/repo/src` are writing the same files, and comparing resolved strings for
+ * equality would let both start. Paths are canonicalised first so a symlink
+ * alias is not a way around it.
+ */
 export async function findWriteConflict(dir: string, exceptWorkerId?: string): Promise<WorkerRecord | undefined> {
-  const target = path.resolve(dir);
+  const target = await canonical(dir);
   for (const worker of await listLiveWorkers()) {
     if (!worker.record.writeAccess) continue;
     if (worker.record.workerId === exceptWorkerId) continue;
-    if (writeTarget(worker.record) === target) return worker.record;
+    if (overlaps(await writeTarget(worker.record), target)) return worker.record;
   }
   return undefined;
 }
@@ -162,12 +184,15 @@ export async function waitForSupervisor(
       const isOurs = expectedPid === undefined || current.record.supervisorPid === expectedPid;
       if (isOurs) {
         last = current;
-        if (current.record.state !== "starting") return current;
+        if (current.record.state !== "starting") return { ...current, confirmed: true };
       }
     }
     await delay(120);
   }
-  return last;
+  // Deadline reached with the worker still `starting`: that is NOT a start we
+  // may report as successful. The caller is told so explicitly rather than
+  // being handed a record that merely looks plausible.
+  return last === undefined ? undefined : { ...last, confirmed: false };
 }
 
 /**
@@ -178,14 +203,26 @@ export async function waitForSupervisor(
  */
 export async function waitForWorker(
   workerId: string,
-  opts: { timeoutMs: number; sinceSeq?: number; states?: readonly string[] },
+  opts: {
+    timeoutMs: number;
+    sinceSeq?: number;
+    states?: readonly string[];
+    /** Only count events a manager would actually want to read. */
+    messagesOnly?: boolean;
+  },
 ): Promise<{ worker: ResolvedWorker | undefined; reason: "event" | "state" | "timeout" | "gone" }> {
   const deadline = Date.now() + opts.timeoutMs;
   const states = new Set(opts.states ?? []);
   for (;;) {
     const worker = await resolveWorker(workerId);
     if (worker === undefined) return { worker: undefined, reason: "gone" };
-    if (opts.sinceSeq !== undefined && worker.record.lastSeq > opts.sinceSeq) return { worker, reason: "event" };
+    if (opts.sinceSeq !== undefined && worker.record.lastSeq > opts.sinceSeq) {
+      // "The worker said something" must not be satisfied by a lifecycle status
+      // event - `turn started` is not a message anyone wants to read.
+      if (opts.messagesOnly !== true) return { worker, reason: "event" };
+      const { entries } = await readSince<WorkerEvent>(worker.record.paths.journal, opts.sinceSeq, 200);
+      if (entries.some((e) => HIGH_SIGNAL_EVENTS.includes(e.type))) return { worker, reason: "event" };
+    }
     if (states.size > 0 && states.has(worker.record.state)) return { worker, reason: "state" };
     if (!worker.alive && !isLiveState(worker.record.state)) return { worker, reason: "state" };
     if (Date.now() >= deadline) return { worker, reason: "timeout" };

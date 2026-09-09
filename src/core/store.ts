@@ -223,6 +223,26 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * True when `pid` is alive AND is the supervisor for `workerId`.
+ *
+ * A bare `kill(pid, 0)` is not enough: after a supervisor dies its pid can be
+ * reused by something else entirely, and a recycled pid would make a dead
+ * worker report as `running` forever. The supervisor sets its process title to
+ * `agent-worker:<id>`, so on Linux the identity is checkable. Where /proc is
+ * unavailable this degrades to liveness alone, which is what it was before.
+ */
+export function supervisorAlive(pid: number, workerId: string): boolean {
+  if (!pidAlive(pid)) return false;
+  try {
+    const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ");
+    if (cmdline.length === 0) return true;
+    return cmdline.includes(`agent-worker:${workerId}`) || cmdline.includes(workerId);
+  } catch {
+    return true; // not Linux, or /proc not readable: fall back to liveness
+  }
+}
+
 /* ── write-target locks ────────────────────────────────────────────────── */
 
 /**
@@ -236,8 +256,21 @@ export function pidAlive(pid: number): boolean {
  * Locks live in the state directory, keyed by a hash of the target, so nothing
  * is ever written into the user's repository.
  */
-function lockPath(writeDir: string): string {
-  const hash = createHash("sha256").update(path.resolve(writeDir)).digest("hex").slice(0, 20);
+/**
+ * Canonical form of a path: symlinks resolved, so `/repo`, a symlink to it, and
+ * `/repo/.` all key the same lock. Falls back to `path.resolve` for a path that
+ * does not exist yet.
+ */
+export async function canonical(p: string): Promise<string> {
+  try {
+    return await fsp.realpath(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+function lockPath(canonicalDir: string): string {
+  const hash = createHash("sha256").update(canonicalDir).digest("hex").slice(0, 20);
   return path.join(stateDir(), "locks", `${hash}.lock`);
 }
 
@@ -253,9 +286,28 @@ export async function acquireWriteLock(
   writeDir: string,
   workerId: string,
 ): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
-  const file = lockPath(writeDir);
+  return acquireLock(lockPath(await canonical(writeDir)), workerId, await canonical(writeDir));
+}
+
+/**
+ * Exclusive lock on a worker id itself, so two concurrent resumes cannot both
+ * spawn a supervisor for one worker - which would put two processes on the same
+ * provider session, the same journal and the same socket path.
+ */
+export async function acquireSupervisorLock(
+  workerId: string,
+): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
+  const file = path.join(stateDir(), "locks", `supervisor-${createHash("sha256").update(workerId).digest("hex").slice(0, 20)}.lock`);
+  return acquireLock(file, workerId, workerId);
+}
+
+async function acquireLock(
+  file: string,
+  workerId: string,
+  subject: string,
+): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
   await fsp.mkdir(path.dirname(file), { recursive: true });
-  const payload = JSON.stringify({ workerId, pid: process.pid, dir: path.resolve(writeDir), at: new Date().toISOString() });
+  const payload = JSON.stringify({ workerId, pid: process.pid, subject, at: new Date().toISOString() });
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -266,14 +318,17 @@ export async function acquireWriteLock(
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       const held = await readJson<{ workerId: string; pid: number }>(file);
-      if (held !== undefined && held.workerId !== workerId && pidAlive(held.pid)) {
+      // A lock held by *this* worker id from a previous run is ours to reclaim;
+      // one held by a different, still-live worker is not.
+      if (held !== undefined && pidAlive(held.pid) && held.pid !== process.pid) {
+        if (held.workerId !== workerId) return { heldBy: held };
         return { heldBy: held };
       }
       // Stale (crashed owner, or our own previous run): reclaim it and retry.
       await fsp.rm(file, { force: true });
     }
   }
-  throw new Error(`could not acquire the write lock for ${writeDir}`);
+  throw new Error(`could not acquire the lock for ${subject}`);
 }
 
 /** Remove a worker's directory and socket. Used by `worker_stop --purge`. */

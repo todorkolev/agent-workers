@@ -149,6 +149,24 @@ A blanket bypass is never a default. When a worker is blocked by permissions, th
 fix is `allowedTools` with the specific tools it needs — not
 `bypassPermissions`.
 
+## Write isolation
+
+`writeAccess: true` requires isolation. `worker_start` refuses it without
+`worktree: true` or a `worktreePath`, unless you pass `allowMainCheckout: true` -
+which exists so that writing into a plain directory is a decision, never an
+omission.
+
+Two live write workers may never share a target. Enforcement is an atomic lock
+file under the state directory keyed by the canonical path, so:
+
+- a race between two starts has exactly one winner;
+- `/repo` and `/repo/src` conflict, because they are the same files;
+- a symlink alias is not a way around it;
+- a lock whose owner has died is reclaimed.
+
+A `worktreePath` pointing at the repository's own primary checkout is refused:
+that is not isolation.
+
 ## Nesting
 
 `allowNestedWorkers` is `false` by default. While it is off:

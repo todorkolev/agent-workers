@@ -265,6 +265,12 @@ export type WorkerRecord = {
   lastSeq: number;
   /** Pending decisions the manager still has to answer. */
   pending: Array<{ requestId: string; kind: "permission" | "question"; text: string; ts: string }>;
+  /**
+   * Guidance accepted while the worker was blocked, not yet delivered. Persisted
+   * because the manager was told it was accepted - dropping it on a crash would
+   * make that acknowledgement false.
+   */
+  queued?: Array<{ text: string; at: string }>;
   owner: WorkerOwner;
   createdAt: string;
   updatedAt: string;

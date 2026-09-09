@@ -55,12 +55,23 @@ Three mechanisms keep that true in practice:
    covered by a test.
 2. The supervisor serializes its own record writes through a promise chain, so
    "one writer" also means "one write at a time".
-3. A write worker takes an exclusive lock on the directory it will edit, keyed
-   by a hash of that path under the state directory. The bridge's "is anyone
-   already writing here?" scan runs before either supervisor exists, so on its
-   own it is check-then-act: two starts racing each other both pass it. Creating
-   the lock is atomic, so exactly one wins. A lock whose owner is gone is
-   reclaimed, or one crash would make a directory permanently unusable.
+3. A write worker takes an exclusive lock on the directory it will edit, and a
+   supervisor takes one on its worker id. Both are created with an atomic
+   `open(wx)` and keyed by a canonical path, so:
+   - two `worker_start` calls racing for one directory have exactly one winner
+     (the bridge's scan runs before either supervisor exists, so on its own it is
+     check-then-act);
+   - two concurrent `worker_resume` calls cannot both spawn a supervisor for one
+     worker, which would put two processes on one provider session, one journal
+     and one socket path;
+   - `/repo`, `/repo/src` and a symlink alias all resolve to the same lock.
+
+   A lock whose owning process is gone is reclaimed, or one crash would make a
+   directory permanently unusable.
+
+Liveness checks the process's *identity*, not just its pid: after a supervisor
+dies its pid can be reused, and `kill(pid, 0)` alone would report a dead worker
+as running forever.
 
 ## Ownership vs. reading
 

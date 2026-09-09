@@ -17,11 +17,13 @@
 import type { Server } from "node:net";
 import * as fsp from "node:fs/promises";
 import {
+  acquireSupervisorLock,
   acquireWriteLock,
   appendLine,
   appendText,
   ensureDirs,
   readRecord,
+  readJson,
   workerPaths,
   writeJsonAtomic,
   type WriteLock,
@@ -44,6 +46,18 @@ import { CodexAppServerAdapter } from "../providers/codex/adapter.ts";
 import type { SupervisorSpec } from "./spec.ts";
 
 const log = createLogger("supervisor");
+
+/** The highest `seq` actually written to a journal file. */
+async function lastJournalSeq(file: string): Promise<number> {
+  const { readSince } = await import("../core/store.ts");
+  let highest = 0;
+  for (;;) {
+    const { entries, more } = await readSince<{ seq: number }>(file, highest, 5000);
+    if (entries.length === 0) return highest;
+    highest = entries[entries.length - 1]?.seq ?? highest;
+    if (!more) return highest;
+  }
+}
 
 /** Text queued while the worker was blocked on a decision. */
 type QueuedSend = { text: string; at: string };
@@ -68,6 +82,8 @@ export class Supervisor {
   private writeChain: Promise<void> = Promise.resolve();
   /** Held for the lifetime of a write worker; see {@link acquireWriteLock}. */
   private writeLock: WriteLock | undefined;
+  /** Held for this process's whole life: exactly one supervisor per worker. */
+  private supervisorLock: WriteLock | undefined;
 
   constructor(spec: SupervisorSpec) {
     this.spec = spec;
@@ -107,13 +123,35 @@ export class Supervisor {
     // and every cursor the manager holds would then point at the wrong event.
     const prior = await readRecord(this.spec.workerId);
     if (prior !== undefined) {
-      this.seq = prior.lastSeq;
-      this.record.lastSeq = prior.lastSeq;
+      // The journal, not the checkpoint, is the authority. Events are appended
+      // before `lastSeq` is persisted, so a crash in that window leaves the
+      // record behind the file - and starting from the record would reuse a
+      // sequence number a manager may already hold as a cursor.
+      const journalSeq = await lastJournalSeq(this.record.paths.journal);
+      this.seq = Math.max(prior.lastSeq, journalSeq);
+      this.record.lastSeq = this.seq;
       this.record.createdAt = prior.createdAt;
       if (this.record.actualModel === undefined && prior.actualModel !== undefined) {
         this.record.actualModel = prior.actualModel;
       }
+      // Restore what a manager would otherwise silently lose on recovery.
+      this.queued.push(...(prior.queued ?? []));
+      const snapshot = await readJson<WorkerResult>(this.record.paths.result);
+      if (snapshot !== undefined) {
+        this.lastFinal = snapshot.final;
+        for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
+      }
     }
+
+    // Claim the worker id first. Two concurrent resumes would otherwise both
+    // probe the dead socket, both remove it, and both bind - putting two
+    // processes on one provider session, one journal and one socket path.
+    const own = await acquireSupervisorLock(this.spec.workerId);
+    if ("heldBy" in own) {
+      log.error(`another supervisor (pid ${own.heldBy.pid}) already owns worker ${this.spec.workerId}`);
+      process.exit(3);
+    }
+    this.supervisorLock = own.lock;
 
     // Claim the directory before anything can edit it. The bridge's scan for a
     // conflicting writer happens before this process exists, so on its own it is
@@ -279,6 +317,7 @@ export class Supervisor {
   /** Deliver anything the manager sent while the worker was blocked. */
   private async drainQueue(): Promise<void> {
     const next = this.queued.shift();
+    this.record.queued = [...this.queued];
     if (next === undefined) return;
     try {
       const result = await this.adapter.startTurn(next.text);
@@ -342,6 +381,10 @@ export class Supervisor {
     }
     if (this.record.state === "blocked") {
       this.queued.push({ text, at: new Date().toISOString() });
+      // Persisted, because the manager was told this text was accepted: losing
+      // it to a crash would make that acknowledgement a lie.
+      this.record.queued = [...this.queued];
+      await this.persist();
       return { ok: true, op: "send", delivery: "queued_after_block", record: this.record,
         note: "The worker is waiting on a decision. Answer it with worker_respond; this text follows." };
     }
@@ -524,10 +567,12 @@ export class Supervisor {
   private async teardown(): Promise<void> {
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
-    try {
-      await this.writeLock?.release();
-    } catch {
-      /* a stale lock is reclaimed by the next owner anyway */
+    for (const lock of [this.writeLock, this.supervisorLock]) {
+      try {
+        await lock?.release();
+      } catch {
+        /* a stale lock is reclaimed by the next owner anyway */
+      }
     }
     try {
       await this.adapter.dispose();

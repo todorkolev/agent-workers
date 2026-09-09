@@ -51,6 +51,12 @@ function str(value: unknown): string | undefined {
 function textInput(text: string): Array<Record<string, unknown>> {
   return [{ type: "text", text, text_elements: [] }];
 }
+const delay = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
+
 function firstLine(text: string, max = 220): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
@@ -168,8 +174,16 @@ export class CodexAppServerAdapter implements ProviderAdapter {
       for (const cb of this.exitCbs) cb({ code, signal });
     });
 
-    readline.createInterface({ input: child.stdout }).on("line", (line) => this.onStdoutLine(line));
-    readline.createInterface({ input: child.stderr }).on("line", (line) => {
+    // A pipe that closes under us emits an asynchronous 'error'. Unhandled,
+    // that is an uncaught exception which kills the supervisor before it can
+    // record why the worker died.
+    child.stdin.on("error", (err) => log.warn("codex stdin error:", err));
+    const outReader = readline.createInterface({ input: child.stdout });
+    outReader.on("error", (err) => log.warn("codex stdout error:", err));
+    outReader.on("line", (line) => this.onStdoutLine(line));
+    const errReader = readline.createInterface({ input: child.stderr });
+    errReader.on("error", (err) => log.warn("codex stderr error:", err));
+    errReader.on("line", (line) => {
       // bubblewrap notices are normal here; they are logged, never fatal.
       if (line.length === 0) return;
       for (const cb of this.stderrCbs) cb(line);
@@ -261,12 +275,15 @@ export class CodexAppServerAdapter implements ProviderAdapter {
     if (threadId === undefined || turnId === undefined) return;
     const ended = this.waitForTurnEnd();
     try {
-      await this.request("turn/interrupt", { threadId, turnId });
+      await this.request("turn/interrupt", { threadId, turnId }, 30_000);
     } catch (err) {
       // The interrupt can race a turn that was already completing.
       log.warn("turn/interrupt rejected:", err);
     }
-    await ended;
+    // Bounded: if the terminal notification never arrives, the caller still gets
+    // an answer rather than an interrupt that hangs for the session's lifetime.
+    await Promise.race([ended, delay(30_000)]);
+    this._turnId = undefined;
   }
 
   /** Answer a parked approval / user-input request with the manager's decision. */
@@ -291,9 +308,12 @@ export class CodexAppServerAdapter implements ProviderAdapter {
         });
         return;
       case "userInput": {
-        const answers: Record<string, unknown> = {};
+        // ToolRequestUserInputAnswer is `{ answers: string[] }` in the generated
+        // bindings - not a content block. Sending the wrong shape leaves the
+        // turn waiting while the manager is told it was answered.
+        const answers: Record<string, { answers: string[] }> = {};
         for (const qid of parked.questionIds ?? []) {
-          answers[qid] = { type: "text", text: decision.text ?? "" };
+          answers[qid] = { answers: [decision.text ?? ""] };
         }
         this.write({ id: parked.id, result: { answers } });
         return;
@@ -334,14 +354,38 @@ export class CodexAppServerAdapter implements ProviderAdapter {
     return threadId;
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
+  /**
+   * Send a JSON-RPC request and await its response.
+   *
+   * The timeout is not optional politeness: a reply that is malformed, carries
+   * an unknown id, or never arrives would otherwise leave the promise pending
+   * forever - wedging the worker in `starting`, or leaving a turn that can
+   * never be steered or interrupted.
+   */
+  private request(method: string, params: unknown, timeoutMs = 120_000): Promise<unknown> {
     if (this.exitError) return Promise.reject(this.exitError);
     const id = this.nextId++;
     return new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`codex ${method} did not answer within ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+      timer.unref?.();
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+        method,
+      });
       try {
         this.write({ jsonrpc: "2.0", id, method, params });
       } catch (err) {
+        clearTimeout(timer);
         this.pending.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -532,9 +576,13 @@ export class CodexAppServerAdapter implements ProviderAdapter {
           ...withTurn,
           data: { willRetry },
         });
-        // A retryable error keeps the same turn alive; only a terminal one ends it.
+        // A retryable error keeps the same turn alive; only a terminal one ends
+        // it - and a terminal end MUST be announced, or the supervisor sits in
+        // `running` against a turn id the backend has already discarded.
         if (!willRetry) {
+          this.emit({ ts, type: "turn_completed", rawType: method, text: "turn failed", ...withTurn, data: { status: "failed" } });
           this._turnId = undefined;
+          this.lastAgentMessage = undefined;
           this.resolveTurnEnd();
         }
         return;

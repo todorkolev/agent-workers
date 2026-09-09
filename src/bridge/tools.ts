@@ -25,7 +25,7 @@ import {
 } from "../core/config.ts";
 import { probeProvider } from "../core/availability.ts";
 import { ensureWorktree, repoRoot } from "../core/git.ts";
-import { readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
+import { canonical, readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
 import {
   DEFAULT_TRANSCRIPT_MODE,
   isTerminalState,
@@ -92,6 +92,14 @@ export const startSchema = {
     .describe("Reasoning effort, forwarded verbatim (e.g. 'high', 'max'). The backend validates it."),
   cwd: z.string().optional().describe("Working directory. Defaults to the manager's project directory."),
   writeAccess: z.boolean().optional().describe("Allow the worker to edit files. Default false (read-only)."),
+  allowMainCheckout: z
+    .boolean()
+    .optional()
+    .describe(
+      "Permit a write worker to edit the directory directly instead of an isolated worktree. " +
+        "Off by default: without it, writeAccess requires worktree or worktreePath, so a worker " +
+        "never edits your own checkout by omission.",
+    ),
   worktree: z
     .boolean()
     .optional()
@@ -300,6 +308,19 @@ export async function workerStart(
 
   const writeAccess = input.writeAccess ?? false;
 
+  // Isolation has to be the default, not the diligent choice. Forgetting
+  // `worktree` on a write worker would otherwise hand it the manager's own
+  // checkout, which is exactly the accident the worktree machinery exists to
+  // prevent.
+  const isolated = input.worktree === true || input.worktreePath !== undefined || input.branch !== undefined;
+  if (writeAccess && !isolated && input.allowMainCheckout !== true) {
+    return fail(
+      "A write worker needs its own worktree: pass worktree: true (or worktreePath). " +
+        "To let it edit this directory directly - including your main checkout - pass " +
+        "allowMainCheckout: true and say so deliberately.",
+    );
+  }
+
   // Worktree resolution. An existing directory or branch is adopted rather than
   // recreated, so a caller who pre-made the worktree is never told their branch
   // already exists.
@@ -328,7 +349,7 @@ export async function workerStart(
   // One live writer per directory. This is a correctness rule, not a quota:
   // two agents editing one checkout corrupt each other's work silently.
   if (writeAccess) {
-    const conflict = await findWriteConflict(effectiveCwd, workerId);
+    const conflict = await findWriteConflict(await canonical(effectiveCwd), workerId);
     if (conflict !== undefined) {
       return fail(
         `Worker "${conflict.workerId}" (${conflict.provider}, ${conflict.state}) is already writing in ${effectiveCwd}. ` +
@@ -389,7 +410,7 @@ export async function workerStart(
         : (["blocked", "failed", "stopped"] as const);
     const outcome = await waitForWorker(workerId, {
       timeoutMs: waitMs,
-      ...(waitFor === "first_message" ? { sinceSeq: 0 } : {}),
+      ...(waitFor === "first_message" ? { sinceSeq: 0, messagesOnly: true } : {}),
       states,
     });
     if (outcome.worker !== undefined) worker = outcome.worker;
@@ -400,6 +421,12 @@ export async function workerStart(
     return fail(
       `Worker "${workerId}" failed to start: ${record.error?.message ?? "unknown error"}\n` +
         `${record.error?.recovery ?? ""}\nLogs: ${record.paths.supervisorLog}`,
+    );
+  }
+  if (worker.confirmed === false) {
+    return fail(
+      `Worker "${workerId}" is still starting after ${waitMs}ms and has not established a ${provider} session. ` +
+        `Check ${record.paths.supervisorLog}. If it recovers it will appear in worker_list.`,
     );
   }
 
@@ -522,7 +549,7 @@ export async function workerWait(
 
   const outcome = await waitForWorker(input.workerId, {
     timeoutMs,
-    ...(until === "message" ? { sinceSeq: input.cursor ?? found.record.lastSeq } : {}),
+    ...(until === "message" ? { sinceSeq: input.cursor ?? found.record.lastSeq, messagesOnly: true } : {}),
     states,
   });
 
@@ -622,12 +649,18 @@ export async function workerStop(
   if (isToolOutput(found)) return found;
 
   if (found.alive) {
-    const response = await callSupervisor(found.record, {
-      op: "stop",
-      owner: owner(ctx),
-      ...(input.takeover === true ? { takeover: true } : {}),
-    });
-    if (!response.ok && response.code === "not_owner") return controlFailure(found.record, response);
+    // Generous: the supervisor snapshots git before it dies, and that can take
+    // longer than an ordinary control round-trip.
+    const response = await callSupervisor(
+      found.record,
+      { op: "stop", owner: owner(ctx), ...(input.takeover === true ? { takeover: true } : {}) },
+      90_000,
+    );
+    if (!response.ok) {
+      // Reporting a stop that did not happen is worse than reporting a failure,
+      // and purging on top of it would delete the journal of a live worker.
+      return controlFailure(found.record, response);
+    }
   } else if (input.purge !== true) {
     // The supervisor is provably gone, so nothing owns this file any more and
     // the bridge may close the record out. Without this, worker_status kept
@@ -637,6 +670,20 @@ export async function workerStop(
   }
 
   if (input.purge === true) {
+    // Only delete once the supervisor is provably gone; otherwise a live
+    // process keeps writing into a directory we just removed.
+    for (let i = 0; i < 40; i += 1) {
+      const still = await resolveWorker(input.workerId);
+      if (still === undefined || !still.alive) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const still = await resolveWorker(input.workerId);
+    if (still !== undefined && still.alive) {
+      return fail(
+        `Worker "${input.workerId}" is still running (pid ${still.record.supervisorPid}); nothing was deleted. ` +
+          "Try worker_stop again, or kill that process first.",
+      );
+    }
     await purgeWorker(input.workerId);
     return ok(`Worker "${input.workerId}" was stopped and its artifacts deleted.`);
   }
@@ -658,6 +705,20 @@ export async function workerRespond(
 ): Promise<ToolOutput> {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
+
+  // A permission request is a yes/no. Accepting "answer" for one meant that
+  // replying with prose - even prose saying "do not run this" - was recorded as
+  // approval and the command ran.
+  const pending = found.record.pending.find((p) => p.requestId === input.requestId);
+  if (pending?.kind === "permission" && input.decision === "answer") {
+    return fail(
+      `"${input.requestId}" is a permission request, not a question. Answer it with ` +
+        'decision: "allow" or decision: "deny" (text is kept as the reason).',
+    );
+  }
+  if (pending?.kind === "question" && input.decision === "allow" && input.text === undefined) {
+    return fail(`"${input.requestId}" is a question. Answer it with decision: "answer" and the text.`);
+  }
   const response = await callSupervisor(found.record, {
     op: "respond",
     requestId: input.requestId,
@@ -745,6 +806,14 @@ export async function workerResume(
   if (worker.record.state === "failed") {
     return fail(
       `Resume failed: ${worker.record.error?.message ?? "unknown error"}\nLogs: ${worker.record.paths.supervisorLog}`,
+    );
+  }
+  if (worker.confirmed === false) {
+    // Still `starting` when the deadline passed. Saying "reattached" here would
+    // be a claim we have no evidence for.
+    return fail(
+      `The resumed supervisor for "${input.workerId}" is still starting and has not reattached to the ` +
+        `${record.provider} session yet. Check ${worker.record.paths.supervisorLog}, then try again.`,
     );
   }
   return ok(

@@ -77,10 +77,19 @@ export async function ensureWorktree(req: WorktreeRequest): Promise<WorktreeInfo
     throw new Error(`git base "${baseRef}" does not resolve to a commit in ${repo}`);
   }
 
+  // Never hand back the repository's own checkout as though it were isolation.
+  const primary = await primaryWorktree(repo);
+  if (primary !== undefined && path.resolve(primary) === dir) {
+    throw new Error(
+      `${dir} is the repository's main checkout, not an isolated worktree. ` +
+        "Omit worktreePath to get a dedicated one, or point it somewhere else.",
+    );
+  }
+
   // 1. Already a worktree? Adopt it exactly as-is.
   const existing = await worktreeAt(repo, dir);
   if (existing !== undefined) {
-    return { path: dir, branch: existing, base: baseSha, created: false };
+    return { path: dir, branch: existing.branch, base: baseSha, created: false };
   }
 
   const dirExists = await pathExists(dir);
@@ -144,16 +153,38 @@ async function excludeFromRepo(repo: string, worktreeDir: string): Promise<void>
   }
 }
 
-/** The branch checked out in `dir`, when `dir` is a worktree of `repo`. */
-async function worktreeAt(repo: string, dir: string): Promise<string | undefined> {
+/**
+ * What is checked out in `dir`, when `dir` is a worktree of `repo`.
+ *
+ * A detached worktree has a `detached` marker instead of a `branch` line;
+ * treating that as "not a worktree" made a perfectly valid directory
+ * un-adoptable.
+ */
+async function worktreeAt(repo: string, dir: string): Promise<{ branch: string } | undefined> {
   const res = await git(repo, ["worktree", "list", "--porcelain"]);
   if (res.code !== 0) return undefined;
+  const target = path.resolve(dir);
   let current: string | undefined;
   for (const line of res.stdout.split("\n")) {
-    if (line.startsWith("worktree ")) current = path.resolve(line.slice("worktree ".length).trim());
-    else if (line.startsWith("branch ") && current === path.resolve(dir)) {
-      return line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+    if (line.startsWith("worktree ")) {
+      current = path.resolve(line.slice("worktree ".length).trim());
+      continue;
     }
+    if (current !== target) continue;
+    if (line.startsWith("branch ")) {
+      return { branch: line.slice("branch ".length).trim().replace(/^refs\/heads\//, "") };
+    }
+    if (line.trim() === "detached") return { branch: "(detached)" };
+  }
+  return undefined;
+}
+
+/** The repository's primary worktree - the first entry `git worktree list` prints. */
+async function primaryWorktree(repo: string): Promise<string | undefined> {
+  const res = await git(repo, ["worktree", "list", "--porcelain"]);
+  if (res.code !== 0) return undefined;
+  for (const line of res.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) return line.slice("worktree ".length).trim();
   }
   return undefined;
 }

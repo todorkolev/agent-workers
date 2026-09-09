@@ -346,15 +346,28 @@ describe("write isolation", () => {
       assert.match(started.text, /branch agent\/wt-writer \(created, base /);
       assert.ok(fs.existsSync(path.join(repo, ".worktrees", "aw-wt-writer")));
 
-      // A second writer aimed at the same directory is refused outright.
-      const conflict = await bridge.call("worker_start", {
+      // A write worker without isolation is refused before anything starts.
+      const unguarded = await bridge.call("worker_start", {
         provider: "claude",
-        workerId: "wt-writer-2",
-        cwd: path.join(repo, ".worktrees", "aw-wt-writer"),
+        workerId: "wt-unguarded",
+        cwd: repo,
         task: "anything",
         writeAccess: true,
       });
-      assert.equal(conflict.isError, true);
+      assert.equal(unguarded.isError, true);
+      assert.match(unguarded.text, /needs its own worktree/);
+
+      // And a second writer aimed at the same worktree is refused as a conflict.
+      const conflict = await bridge.call("worker_start", {
+        provider: "claude",
+        workerId: "wt-writer-2",
+        cwd: repo,
+        worktreePath: path.join(repo, ".worktrees", "aw-wt-writer"),
+        branch: "agent/wt-writer",
+        task: "anything",
+        writeAccess: true,
+      });
+      assert.equal(conflict.isError, true, conflict.text);
       assert.match(conflict.text, /already writing in/);
 
       // Isolation has to be invisible from the main checkout: a stray
@@ -363,6 +376,19 @@ describe("write isolation", () => {
     } finally {
       await bridge.call("worker_stop", { workerId: "wt-writer", takeover: true });
     }
+  });
+
+  it("refuses to edit the repository's own checkout as a worktree", async () => {
+    const res = await bridge.call("worker_start", {
+      provider: "codex",
+      workerId: "wt-primary",
+      cwd: repo,
+      worktreePath: repo,
+      task: "WRITE",
+      writeAccess: true,
+    });
+    assert.equal(res.isError, true, res.text);
+    assert.match(res.text, /main checkout/);
   });
 
   it("refuses a second writer even when two starts race", async () => {
