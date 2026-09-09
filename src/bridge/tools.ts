@@ -25,7 +25,7 @@ import {
 } from "../core/config.ts";
 import { probeProvider } from "../core/availability.ts";
 import { ensureWorktree, repoRoot } from "../core/git.ts";
-import { readJson, readSince, purgeWorker, workerPaths } from "../core/store.ts";
+import { readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
 import {
   DEFAULT_TRANSCRIPT_MODE,
   isTerminalState,
@@ -268,6 +268,9 @@ export async function workerStart(
         "Use worker_send to talk to it, or pick a different workerId.",
     );
   }
+  // A reused id keeps the previous run's journal so existing cursors stay valid.
+  // Say so, or a read from cursor 0 quietly returns the old worker's output.
+  const reusedFrom = existing !== undefined ? existing.record.lastSeq : undefined;
 
   let profile;
   try {
@@ -415,6 +418,12 @@ export async function workerStart(
   );
   if (availability.auth !== undefined) lines.push(`auth: ${availability.auth}`);
   lines.push(`artifacts: ${record.paths.dir}`);
+  if (reusedFrom !== undefined && reusedFrom > 0) {
+    lines.push(
+      `note: this workerId was used before. Its journal continues from seq ${reusedFrom}, so read with ` +
+        `cursor=${reusedFrom} to see only this run.`,
+    );
+  }
   lines.push("");
   lines.push(renderHint(record));
   return ok(lines.join("\n"));
@@ -619,6 +628,12 @@ export async function workerStop(
       ...(input.takeover === true ? { takeover: true } : {}),
     });
     if (!response.ok && response.code === "not_owner") return controlFailure(found.record, response);
+  } else if (input.purge !== true) {
+    // The supervisor is provably gone, so nothing owns this file any more and
+    // the bridge may close the record out. Without this, worker_status kept
+    // reporting `orphaned` after an explicit stop.
+    const stopped: WorkerRecord = { ...found.record, state: "stopped", updatedAt: new Date().toISOString() };
+    await writeJsonAtomic(found.record.paths.record, stopped).catch(() => undefined);
   }
 
   if (input.purge === true) {

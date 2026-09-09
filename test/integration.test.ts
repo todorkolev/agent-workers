@@ -520,6 +520,26 @@ describe("failure reporting", () => {
     }
   });
 
+  it("closes out a worker whose supervisor is already gone", async () => {
+    const started = await bridge.call("worker_start", {
+      provider: "claude",
+      workerId: "stop-orphan",
+      cwd: projectDir,
+      task: "REMEMBER tombstone",
+    });
+    assert.equal(started.isError, false, started.text);
+    const status = await bridge.call("worker_status", { workerId: "stop-orphan" });
+    process.kill(Number(/supervisor pid (\d+)/.exec(status.text)?.[1]), "SIGKILL");
+    await sleep(400);
+    assert.match((await bridge.call("worker_status", { workerId: "stop-orphan" })).text, /state orphaned/);
+
+    await bridge.call("worker_stop", { workerId: "stop-orphan" });
+    // An explicit stop must settle the state, not leave it reading `orphaned`
+    // as though recovery were still on the table.
+    const after = await bridge.call("worker_status", { workerId: "stop-orphan" });
+    assert.match(after.text, /state stopped/);
+  });
+
   it("says a worker does not exist rather than inventing one", async () => {
     const res = await bridge.call("worker_status", { workerId: "no-such-worker" });
     assert.equal(res.isError, true);

@@ -22276,6 +22276,7 @@ async function workerStart(ctx, input) {
       `Worker "${workerId}" already exists and is ${existing.record.state}. Use worker_send to talk to it, or pick a different workerId.`
     );
   }
+  const reusedFrom = existing !== void 0 ? existing.record.lastSeq : void 0;
   let profile;
   try {
     profile = resolveExecProfile(cfg, input.execProfile);
@@ -22399,6 +22400,11 @@ Logs: ${record2.paths.supervisorLog}`
   );
   if (availability.auth !== void 0) lines.push(`auth: ${availability.auth}`);
   lines.push(`artifacts: ${record2.paths.dir}`);
+  if (reusedFrom !== void 0 && reusedFrom > 0) {
+    lines.push(
+      `note: this workerId was used before. Its journal continues from seq ${reusedFrom}, so read with cursor=${reusedFrom} to see only this run.`
+    );
+  }
   lines.push("");
   lines.push(renderHint(record2));
   return ok(lines.join("\n"));
@@ -22534,6 +22540,9 @@ async function workerStop(ctx, input) {
       ...input.takeover === true ? { takeover: true } : {}
     });
     if (!response.ok && response.code === "not_owner") return controlFailure(found.record, response);
+  } else if (input.purge !== true) {
+    const stopped = { ...found.record, state: "stopped", updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    await writeJsonAtomic(found.record.paths.record, stopped).catch(() => void 0);
   }
   if (input.purge === true) {
     await purgeWorker(input.workerId);
