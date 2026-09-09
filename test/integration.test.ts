@@ -330,6 +330,19 @@ describe("write isolation", () => {
     g("commit", "-qm", "initial");
   });
 
+  it("rejects different-prefix launcher worktrees before Git creates anything", async () => {
+    const config=path.join(projectDir,"mapped-config.json");
+    fs.writeFileSync(config,JSON.stringify({execProfiles:{mapped:{name:"mapped",launcher:["env"],pathMap:[{host:repo,target:"/container/repo"}]}}}));
+    const mapped=await openBridge("mapped-test",{AGENT_WORKERS_CONFIG:config});
+    const before=execFileSync("git",["worktree","list","--porcelain"],{cwd:repo}).toString();
+    try {
+      const res=await mapped.call("worker_start",{provider:"codex",workerId:"mapped-wt",cwd:repo,execProfile:"mapped",worktree:true,writeAccess:true,task:"WRITE"});
+      assert.equal(res.isError,true,res.text);
+      assert.match(res.text,/different host and target paths/);
+      assert.equal(execFileSync("git",["worktree","list","--porcelain"],{cwd:repo}).toString(),before);
+    } finally { await mapped.close(); }
+  });
+
   it("puts a write worker in its own worktree cut from an exact base", async () => {
     const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo }).toString().trim();
     const started = await bridge.call("worker_start", {
@@ -430,6 +443,23 @@ describe("write isolation", () => {
         await bridge.call("worker_stop", { workerId: id, takeover: true }).catch(() => undefined);
       }
     }
+  });
+
+  it("retains directory ownership until the old provider has exited", async () => {
+    const marker=path.join(stateHome,"stop-marker");
+    const slow=await openBridge("slow-owner",{FAKE_STOP_DELAY_MS:"1000",FAKE_STOP_MARKER:marker});
+    const id="slow-dispose";
+    try {
+      const start=await slow.call("worker_start",{provider:"codex",workerId:id,cwd:repo,task:"hello",writeAccess:true,worktree:true,waitFor:"idle"});
+      assert.equal(start.isError,false,start.text);
+      const stopping=slow.call("worker_stop",{workerId:id});
+      for(let i=0;i<100&&!fs.existsSync(marker);i++) await sleep(10);
+      assert.ok(fs.existsSync(marker),"provider entered its slow shutdown");
+      const next=await bridge.call("worker_start",{provider:"codex",workerId:"early-replacement",cwd:path.join(repo,".worktrees","aw-"+id),task:"hello",writeAccess:true,allowMainCheckout:true});
+      assert.equal(next.isError,true,next.text);
+      assert.match(next.text,/already writing/);
+      assert.equal((await stopping).isError,false);
+    } finally { await slow.close(); }
   });
 
   it("adopts a worktree that already exists instead of recreating its branch", async () => {
@@ -541,9 +571,9 @@ describe("waiting", () => {
 
 describe("failure reporting", () => {
   it("reports a provider that dies as failed, with the log to look at", async () => {
-    const started = await bridge.call("worker_start", { provider: "claude", cwd: projectDir, task: "CRASH now" });
-    // The provider dies during startup, so the failure surfaces on the start
-    // call itself - with the reason and the log to read, not a silent success.
+    const started = await bridge.call("worker_start", { provider: "claude", cwd: projectDir, task: "CRASH now", waitFor: "idle" });
+    // Await the opening turn: an init notification can race the immediate
+    // process exit, whereas waitFor idle must report that turn's failure.
     assert.equal(started.isError, true, started.text);
     assert.match(started.text, /exited unexpectedly/);
     assert.match(started.text, /supervisor\.log/);
@@ -611,5 +641,32 @@ describe("failure reporting", () => {
     const res = await bridge.call("worker_status", { workerId: "no-such-worker" });
     assert.equal(res.isError, true);
     assert.match(res.text, /No worker "no-such-worker"/);
+  });
+});
+
+
+describe("persisted ownership", () => {
+  it("requires explicit takeover to resume, stop, purge or reuse another manager's dead worker", async () => {
+    const id="dead-owned";
+    const start=await bridge.call("worker_start",{provider:"codex",workerId:id,task:"hello",waitFor:"idle"});
+    assert.equal(start.isError,false,start.text);
+    await bridge.call("worker_stop",{workerId:id});
+    await sleep(400);
+    const other=await openBridge("other-manager");
+    try {
+      for (const [tool,args] of [
+        ["worker_resume",{workerId:id}], ["worker_stop",{workerId:id}],
+        ["worker_stop",{workerId:id,purge:true}],
+        ["worker_start",{workerId:id,provider:"codex",task:"new"}],
+      ] as const) {
+        const res=await other.call(tool,args);
+        assert.equal(res.isError,true,res.text);assert.match(res.text,/not_owner/);
+      }
+      assert.ok(fs.existsSync(path.join(stateHome,"workers",id,"journal.ndjson")));
+      const resumed=await other.call("worker_resume",{workerId:id,takeover:true,task:"hello again"});
+      assert.equal(resumed.isError,false,resumed.text);
+      const stopped=await other.call("worker_stop",{workerId:id});
+      assert.equal(stopped.isError,false,stopped.text);
+    } finally { await other.close(); }
   });
 });

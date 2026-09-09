@@ -1,7 +1,7 @@
 {
   "name": "agent-workers",
   "displayName": "Agent Workers",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Persistent, interactive Claude and Codex workers, driven through one MCP tool contract.",
   "author": { "name": "Todor Kolev" },
   "homepage": "https://github.com/todorkolev/agent-workers",

@@ -1,3 +1,4 @@
+import { terminateChild } from "../../core/process.ts";
 /**
  * Claude worker adapter — a persistent `claude` CLI session in streaming mode.
  *
@@ -250,40 +251,8 @@ export class ClaudeCliAdapter implements ProviderAdapter {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
     this.disposed = true;
-    const child = this.child;
-    if (!child) return;
-    try {
-      child.stdin.end();
-    } catch {
-      /* already closed */
-    }
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const done = (): void => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      child.once("exit", done);
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        done();
-        return;
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* gone */
-        }
-        done();
-      }, 3000);
-      timer.unref?.();
-    });
+    if (this.child) await terminateChild(this.child);
   }
 
   /* ── turns ───────────────────────────────────────────────────────────── */

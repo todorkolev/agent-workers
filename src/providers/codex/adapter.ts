@@ -1,3 +1,4 @@
+import { terminateChild } from "../../core/process.ts";
 /**
  * Codex worker adapter — one `codex app-server` child holding one thread.
  *
@@ -93,7 +94,8 @@ export class CodexAppServerAdapter implements ProviderAdapter {
   private nextId = 1;
   private readonly pending = new Map<JsonRpcId, { resolve: (v: unknown) => void; reject: (e: Error) => void; method: string }>();
   private readonly parked = new Map<string, ParkedRequest>();
-  private turnEndWaiters: Array<() => void> = [];
+  private readonly completedTurns = new Set<string>();
+  private interruptTimeoutMs = 30_000;
   private exitError: Error | undefined;
   /** Text of the most recent completed agentMessage; becomes the turn's final. */
   private lastAgentMessage: string | undefined;
@@ -196,37 +198,8 @@ export class CodexAppServerAdapter implements ProviderAdapter {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
     this.disposed = true;
-    const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
-      this.failAll(new Error("codex app-server disposed"));
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const done = (): void => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      child.once("exit", done);
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        done();
-        return;
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* gone */
-        }
-        done();
-      }, 3000);
-      timer.unref?.();
-    });
+    if (this.child) await terminateChild(this.child);
     this.failAll(new Error("codex app-server disposed"));
   }
 
@@ -273,52 +246,58 @@ export class CodexAppServerAdapter implements ProviderAdapter {
     const threadId = this.threadId;
     const turnId = this._turnId;
     if (threadId === undefined || turnId === undefined) return;
-    const ended = this.waitForTurnEnd();
     try {
-      await this.request("turn/interrupt", { threadId, turnId }, 30_000);
+      await this.request("turn/interrupt", { threadId, turnId }, this.interruptTimeoutMs);
     } catch (err) {
-      // The interrupt can race a turn that was already completing.
-      log.warn("turn/interrupt rejected:", err);
+      if (!this.completedTurns.has(turnId)) throw err;
     }
-    // Bounded: if the terminal notification never arrives, the caller still gets
-    // an answer rather than an interrupt that hangs for the session's lifetime.
-    await Promise.race([ended, delay(30_000)]);
-    this._turnId = undefined;
+    const deadline = Date.now() + this.interruptTimeoutMs;
+    while (!this.completedTurns.has(turnId)) {
+      if (this.exitError) throw this.exitError;
+      if (Date.now() >= deadline) throw new Error(`interrupt of ${turnId} was not confirmed; the turn may still be running`);
+      await delay(10);
+    }
   }
 
   /** Answer a parked approval / user-input request with the manager's decision. */
   async respond(requestId: string, decision: RespondDecision): Promise<void> {
     const parked = this.parked.get(requestId);
     if (!parked) throw new Error(`no pending codex request "${requestId}"`);
-    this.parked.delete(requestId);
-    const allow = decision.decision === "allow" || decision.decision === "answer";
-
+    if (parked.kind !== "userInput" && decision.decision === "answer") {
+      throw new Error("a permission request requires allow or deny");
+    }
+    const allow = decision.decision === "allow";
+    let message: unknown;
     switch (parked.kind) {
       case "commandExecution":
       case "fileChange":
-        this.write({ id: parked.id, result: { decision: allow ? "accept" : "decline" } });
-        return;
+        message = { id: parked.id, result: { decision: allow ? "accept" : "decline" } };
+        break;
       case "legacyExec":
       case "legacyPatch":
-        this.write({
-          id: parked.id,
-          result: {
-            decision: allow ? "approved" : { denied: { rejection: decision.text ?? "denied by the manager" } },
-          },
-        });
-        return;
+        message = { id: parked.id, result: { decision: allow ? "approved" : { denied: { rejection: decision.text ?? "denied by the manager" } } } };
+        break;
       case "userInput": {
-        // ToolRequestUserInputAnswer is `{ answers: string[] }` in the generated
-        // bindings - not a content block. Sending the wrong shape leaves the
-        // turn waiting while the manager is told it was answered.
-        const answers: Record<string, { answers: string[] }> = {};
-        for (const qid of parked.questionIds ?? []) {
-          answers[qid] = { answers: [decision.text ?? ""] };
+        if (decision.decision === "deny") {
+          message = { id: parked.id, error: { code: -32000, message: decision.text ?? "input denied by the manager" } };
+          break;
         }
-        this.write({ id: parked.id, result: { answers } });
-        return;
+        const ids = parked.questionIds ?? [];
+        const supplied = decision.answers ?? (ids.length === 1 && decision.text !== undefined ? { [ids[0]!]: [decision.text] } : undefined);
+        if (!supplied || ids.some(id => !Array.isArray(supplied[id])) || Object.keys(supplied).some(id => !ids.includes(id))) {
+          throw new Error(`answer every question using answers keyed by id: ${ids.join(", ")}`);
+        }
+        const answers = Object.fromEntries(ids.map(id => [id, { answers: supplied[id] }]));
+        message = { id: parked.id, result: { answers } };
+        break;
       }
     }
+    const child = this.child;
+    if (!child || child.stdin.destroyed) throw new Error("codex app-server stdin is not writable");
+    await new Promise<void>((resolve, reject) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`, (err) => err ? reject(err) : resolve());
+    });
+    this.parked.delete(requestId);
   }
 
   /* ── subscriptions ───────────────────────────────────────────────────── */
@@ -482,7 +461,11 @@ export class CodexAppServerAdapter implements ProviderAdapter {
         if (!q) continue;
         const qid = str(q["id"]);
         if (qid !== undefined) ids.push(qid);
-        prompts.push(`${str(q["header"]) ?? ""} ${str(q["question"]) ?? ""}`.trim());
+        const options = Array.isArray(q["options"]) ? q["options"].map(raw => {
+          const option = rec(raw);
+          return `${str(option?.["label"]) ?? ""}: ${str(option?.["description"]) ?? ""}`;
+        }) : [];
+        prompts.push(`[${qid ?? "?"}] ${str(q["header"]) ?? ""} ${str(q["question"]) ?? ""}${options.length ? "\n  " + options.join("\n  ") : ""}`.trim());
       }
       this.parked.set(requestId, { id, kind, questionIds: ids });
       this.emit({
@@ -490,6 +473,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
         type: "question",
         rawType: method,
         text: prompts.join("\n") || "the worker asked a question",
+        data: { questions },
         requestId,
         ...(this._turnId !== undefined ? { turnId: this._turnId } : {}),
       });
@@ -522,6 +506,10 @@ export class CodexAppServerAdapter implements ProviderAdapter {
         return;
       }
       case "turn/completed": {
+        const completedId = str(rec(p["turn"])?.["id"]) ?? turnId;
+        if (completedId !== undefined) this.completedTurns.add(completedId);
+        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.values().next().value!);
+        if (this._turnId !== undefined && completedId !== this._turnId) return;
         const status = str(rec(p["turn"])?.["status"]) ?? "completed";
         // Codex has no distinct "final answer" message: the agent's answer is
         // the last completed agentMessage before the turn ends. Without marking
@@ -533,7 +521,6 @@ export class CodexAppServerAdapter implements ProviderAdapter {
         this.lastAgentMessage = undefined;
         this.emit({ ts, type: "turn_completed", rawType: method, text: `turn ${status}`, ...withTurn, data: { status } });
         this._turnId = undefined;
-        this.resolveTurnEnd();
         return;
       }
       case "turn/plan/updated": {
@@ -583,8 +570,7 @@ export class CodexAppServerAdapter implements ProviderAdapter {
           this.emit({ ts, type: "turn_completed", rawType: method, text: "turn failed", ...withTurn, data: { status: "failed" } });
           this._turnId = undefined;
           this.lastAgentMessage = undefined;
-          this.resolveTurnEnd();
-        }
+          }
         return;
       }
       default:
@@ -643,23 +629,11 @@ export class CodexAppServerAdapter implements ProviderAdapter {
     }
   }
 
-  private waitForTurnEnd(): Promise<void> {
-    if (this._turnId === undefined) return Promise.resolve();
-    return new Promise<void>((resolve) => this.turnEndWaiters.push(resolve));
-  }
-
-  private resolveTurnEnd(): void {
-    const waiters = this.turnEndWaiters;
-    this.turnEndWaiters = [];
-    for (const resolve of waiters) resolve();
-  }
-
   private failAll(error: Error): void {
     if (!this.exitError) this.exitError = error;
     const pending = Array.from(this.pending.values());
     this.pending.clear();
     for (const p of pending) p.reject(error);
-    this.resolveTurnEnd();
   }
 }
 

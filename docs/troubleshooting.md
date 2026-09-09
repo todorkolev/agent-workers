@@ -55,9 +55,11 @@ server's block in `~/.codex/config.toml`:
 default_tools_approval_mode = "approve"
 ```
 
-`scripts/install-codex.sh` does this for you. It pre-approves only the `worker_*`
-tools, which start and steer workers rather than touching your files; each
-worker's own sandbox and permission mode still apply.
+`scripts/install-codex.sh --approve-tools` applies this explicit opt-in only to
+agent-workers. Its tools can create worktrees, change a repository's local Git
+exclude file, start workers that edit files, and delete worker artifacts when
+purge is requested. Worker permissions still apply to the provider; they do
+not constrain these bridge-side operations.
 
 ## "the codex CLI is not logged in"
 

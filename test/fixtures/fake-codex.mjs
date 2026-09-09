@@ -9,6 +9,7 @@
  * requests that the client MUST answer.
  */
 
+import * as fs from "node:fs";
 import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 
@@ -171,4 +172,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
 });
 
-process.stdin.on("end", () => process.exit(0));
+let stopping=false;
+function stop() {
+  if(stopping) return;
+  stopping=true;
+  const ms=Number(process.env.FAKE_STOP_DELAY_MS ?? 0);
+  if(ms>0) {
+    if(process.env.FAKE_STOP_MARKER) fs.writeFileSync(process.env.FAKE_STOP_MARKER,"stopping");
+    setTimeout(()=>process.exit(0),ms);
+  } else process.exit(0);
+}
+process.stdin.on("end", stop);
+if(Number(process.env.FAKE_STOP_DELAY_MS ?? 0)>0) process.on("SIGTERM",stop);

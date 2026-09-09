@@ -256,6 +256,8 @@ export type WorkerRecord = {
   cwd: string;
   /** Set when the worker runs in a git worktree this tool created or adopted. */
   worktree?: { path: string; branch: string; base: string; created: boolean };
+  /** Exact HEAD observed after acquiring the write lock, before the first turn. */
+  startingHead?: string;
   writeAccess: boolean;
   transcriptMode: TranscriptMode;
   execProfile: string;
@@ -425,6 +427,8 @@ export type RespondDecision = {
   decision: "allow" | "deny" | "answer";
   /** Required for `answer`, optional explanation for `deny`. */
   text?: string;
+  /** Codex user-input answers keyed by question id; text is for one question only. */
+  answers?: Record<string, string[]>;
 };
 
 /* ────────────────────────────────────────────────────────────────────────

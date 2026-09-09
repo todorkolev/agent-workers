@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -130,7 +131,9 @@ function supervisorEntry(): string {
 export async function spawnSupervisor(spec: SupervisorSpec): Promise<{ pid: number; specPath: string }> {
   await ensureDirs(spec.workerId);
   const paths = workerPaths(spec.workerId);
-  const specPath = path.join(paths.dir, "spec.json");
+  // Each attempt owns its input file. The winning supervisor alone publishes
+  // spec.json after taking the worker-id lock.
+  const specPath = path.join(paths.dir, `launch-${randomUUID()}.json`);
   await writeJsonAtomic(specPath, spec);
 
   const entry = supervisorEntry();
@@ -140,7 +143,8 @@ export async function spawnSupervisor(spec: SupervisorSpec): Promise<{ pid: numb
     );
   }
 
-  const logFd = fs.openSync(paths.supervisorLog, "a");
+  const logFd = fs.openSync(paths.supervisorLog, "a", 0o600);
+  fs.fchmodSync(logFd, 0o600);
   const child = spawn(process.execPath, [entry, "--spec", specPath], {
     detached: true,
     stdio: ["ignore", logFd, logFd],

@@ -55,19 +55,20 @@ Three mechanisms keep that true in practice:
    covered by a test.
 2. The supervisor serializes its own record writes through a promise chain, so
    "one writer" also means "one write at a time".
-3. A write worker takes an exclusive lock on the directory it will edit, and a
-   supervisor takes one on its worker id. Both are created with an atomic
-   `open(wx)` and keyed by a canonical path, so:
-   - two `worker_start` calls racing for one directory have exactly one winner
-     (the bridge's scan runs before either supervisor exists, so on its own it is
-     check-then-act);
-   - two concurrent `worker_resume` calls cannot both spawn a supervisor for one
-     worker, which would put two processes on one provider session, one journal
-     and one socket path;
-   - `/repo`, `/repo/src` and a symlink alias all resolve to the same lock.
+3. Short filesystem ticket arbitration serializes claims. Each contender
+   publishes its own choosing/ticket record atomically; crashed contenders are
+   ignored by process liveness. Under that arbitration, write claims compare
+   canonical path containment, so `/repo`, `/repo/src` and symlink aliases
+   conflict. Independent directories remain concurrent. Worker-id claims use
+   the same arbitration, preventing concurrent resumes and dead-worker purge.
+   Per-attempt launch specs do not overwrite the winning supervisor's saved
+   spec. Claims remain held until provider exit is observed and the control
+   socket is closed. A dead claim owner can be reclaimed without removing a
+   live replacement's claim.
 
-   A lock whose owning process is gone is reclaimed, or one crash would make a
-   directory permanently unusable.
+State and socket directories are private (`0700`), and persisted profiles,
+journals, results and logs are `0600`. Existing state permissions are repaired;
+unexpected ownership or symlink state directories are refused.
 
 Liveness checks the process's *identity*, not just its pid: after a supervisor
 dies its pid can be reused, and `kill(pid, 0)` alone would report a dead worker
@@ -177,6 +178,10 @@ recovery stay on one filesystem. Only the provider child is launched through the
 profile's `launcher` argv, with `pathMap` translating the working directory into
 the target's namespace. "Manager outside the container, workers inside" is then
 configuration, not a code path - and no container provisioning is involved.
+Different-prefix mappings cannot be used with bridge-created/adopted worktrees:
+Git metadata contains absolute paths. Such starts fail before worktree creation.
+For those worktrees, run the bridge, supervisor, Git and providers inside the
+same container and pass container paths. See docs/configuration.md.
 
 ## Nesting
 

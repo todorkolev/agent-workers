@@ -19,7 +19,9 @@ __export(store_exports, {
   canonical: () => canonical,
   ensureDirs: () => ensureDirs,
   listWorkerIds: () => listWorkerIds,
+  pathsOverlap: () => pathsOverlap,
   pidAlive: () => pidAlive,
+  privateDir: () => privateDir,
   purgeWorker: () => purgeWorker,
   readJson: () => readJson,
   readJsonSync: () => readJsonSync,
@@ -37,7 +39,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 function stateDir() {
   const fromEnv = process.env["AGENT_WORKERS_HOME"];
   if (fromEnv && fromEnv.length > 0) return path.resolve(fromEnv);
@@ -68,17 +70,40 @@ function workerPaths(workerId) {
     socket: path.join(socketDir(), `${hash}.sock`)
   };
 }
+async function privateDir(dir) {
+  await fsp.mkdir(dir, { recursive: true, mode: 448 });
+  const stat = await fsp.lstat(dir);
+  if (!stat.isDirectory() || process.getuid && stat.uid !== process.getuid()) {
+    throw new Error(`state directory must be owned by the current user and cannot be a symlink: ${dir}`);
+  }
+  await fsp.chmod(dir, 448);
+}
 async function ensureDirs(workerId) {
-  await fsp.mkdir(path.join(stateDir(), "workers"), { recursive: true });
-  await fsp.mkdir(socketDir(), { recursive: true, mode: 448 });
-  if (workerId !== void 0) await fsp.mkdir(workerDir(workerId), { recursive: true });
+  await privateDir(stateDir());
+  await privateDir(path.join(stateDir(), "workers"));
+  await privateDir(socketDir());
+  if (workerId !== void 0) {
+    const dir = workerDir(workerId);
+    await privateDir(dir);
+    for (const name of await fsp.readdir(dir)) {
+      const file = path.join(dir, name);
+      const stat = await fsp.lstat(file).catch(() => void 0);
+      if (!stat) continue;
+      if (!stat.isFile() || process.getuid && stat.uid !== process.getuid()) {
+        throw new Error(`unexpected ownership or file type in worker state: ${file}`);
+      }
+      await fsp.chmod(file, 384).catch((err) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    }
+  }
 }
 async function writeJsonAtomic(file, value) {
   tmpCounter += 1;
   const tmp = `${file}.${process.pid}.${tmpCounter}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   try {
     await fsp.writeFile(tmp, `${JSON.stringify(value, null, 2)}
-`, "utf8");
+`, { encoding: "utf8", mode: 384, flag: "wx" });
     await fsp.rename(tmp, file);
   } catch (err) {
     await fsp.rm(tmp, { force: true }).catch(() => void 0);
@@ -109,14 +134,14 @@ function appendLine(file, value) {
 `;
   }
   try {
-    fs.appendFileSync(file, line, "utf8");
+    fs.appendFileSync(file, line, { encoding: "utf8", mode: 384 });
   } catch {
   }
 }
 function appendText(file, text) {
   try {
     fs.appendFileSync(file, text.endsWith("\n") ? text : `${text}
-`, "utf8");
+`, { encoding: "utf8", mode: 384 });
   } catch {
   }
 }
@@ -194,26 +219,83 @@ function lockPath(canonicalDir) {
   const hash = createHash("sha256").update(canonicalDir).digest("hex").slice(0, 20);
   return path.join(stateDir(), "locks", `${hash}.lock`);
 }
+async function arbitrate(action) {
+  await privateDir(stateDir());
+  const dir = path.join(stateDir(), "arbitration");
+  await privateDir(dir);
+  const id = randomUUID();
+  const file = path.join(dir, `${id}.json`);
+  const read = async (name) => {
+    const value = await readJson(path.join(dir, name));
+    if (value && !pidAlive(value.pid)) {
+      await fsp.rm(path.join(dir, name), { force: true });
+      return void 0;
+    }
+    return value;
+  };
+  const names = async () => (await fsp.readdir(dir)).filter((n) => n.endsWith(".json"));
+  await writeJsonAtomic(file, { pid: process.pid, choosing: true, number: 0 });
+  try {
+    let number = 1;
+    for (const name of await names()) number = Math.max(number, ((await read(name))?.number ?? 0) + 1);
+    await writeJsonAtomic(file, { pid: process.pid, choosing: false, number });
+    const deadline = Date.now() + 3e4;
+    for (const name of await names()) {
+      if (name === `${id}.json`) continue;
+      for (; ; ) {
+        const other = await read(name);
+        if (!other || !other.choosing && (other.number > number || other.number === number && name > `${id}.json`)) break;
+        if (Date.now() >= deadline) throw new Error("timed out arbitrating worker ownership; retry the operation");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
+    return await action();
+  } finally {
+    await fsp.rm(file, { force: true });
+  }
+}
+function pathsOverlap(a, b) {
+  const inside = (parent, child) => {
+    const relative2 = path.relative(parent, child);
+    return relative2 === "" || relative2 !== ".." && !relative2.startsWith(`..${path.sep}`) && !path.isAbsolute(relative2);
+  };
+  return inside(a, b) || inside(b, a);
+}
 async function acquireWriteLock(writeDir, workerId) {
-  return acquireLock(lockPath(await canonical(writeDir)), workerId, await canonical(writeDir));
+  const target = await canonical(writeDir);
+  return arbitrate(async () => {
+    const dir = path.join(stateDir(), "locks");
+    await privateDir(dir);
+    for (const name of await fsp.readdir(dir)) {
+      if (!name.endsWith(".lock") || name.startsWith("supervisor-")) continue;
+      const held = await readJson(path.join(dir, name));
+      if (held && pidAlive(held.pid) && pathsOverlap(target, held.subject)) return { heldBy: held };
+    }
+    return acquireLock(lockPath(target), workerId, target);
+  });
 }
 async function acquireSupervisorLock(workerId) {
   const file = path.join(stateDir(), "locks", `supervisor-${createHash("sha256").update(workerId).digest("hex").slice(0, 20)}.lock`);
-  return acquireLock(file, workerId, workerId);
+  return arbitrate(() => acquireLock(file, workerId, workerId));
 }
 async function acquireLock(file, workerId, subject) {
-  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await privateDir(path.dirname(file));
   const payload = JSON.stringify({ workerId, pid: process.pid, subject, at: (/* @__PURE__ */ new Date()).toISOString() });
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const handle = await fsp.open(file, "wx");
+      const handle = await fsp.open(file, "wx", 384);
       await handle.writeFile(payload, "utf8");
       await handle.close();
-      return { lock: { path: file, release: async () => fsp.rm(file, { force: true }).then(() => void 0) } };
+      let released = false;
+      return { lock: { path: file, release: async () => {
+        if (released) return;
+        released = true;
+        await fsp.rm(file, { force: true });
+      } } };
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
       const held = await readJson(file);
-      if (held !== void 0 && pidAlive(held.pid) && held.pid !== process.pid) {
+      if (held !== void 0 && pidAlive(held.pid)) {
         if (held.workerId !== workerId) return { heldBy: held };
         return { heldBy: held };
       }
@@ -272,6 +354,7 @@ function createLogger(scope) {
 // src/supervisor/supervisor.ts
 init_store();
 import * as fsp2 from "node:fs/promises";
+import * as path2 from "node:path";
 
 // src/core/control.ts
 import * as net from "node:net";
@@ -353,6 +436,10 @@ async function repoRoot(dir) {
   const res = await git(dir, ["rev-parse", "--show-toplevel"]);
   return res.code === 0 ? res.stdout.trim() : void 0;
 }
+async function resolveCommit(dir, ref) {
+  const res = await git(dir, ["rev-parse", "--verify", `${ref}^{commit}`]);
+  return res.code === 0 ? res.stdout.trim() : void 0;
+}
 async function summarizeWork(dir, base) {
   const empty = { changedFiles: [], diff: "", diffStat: "" };
   const root = await repoRoot(dir);
@@ -376,7 +463,7 @@ async function summarizeWork(dir, base) {
   const branchRes = await git(dir, ["rev-parse", "--abbrev-ref", "HEAD"]);
   if (head.code === 0 && head.stdout.includes("\0")) {
     const [sha, subject] = head.stdout.trim().split("\0");
-    if (sha !== void 0 && sha !== base) {
+    if (base !== void 0 && sha !== void 0 && sha !== base) {
       summary.commit = {
         sha,
         subject: subject ?? "",
@@ -387,10 +474,48 @@ async function summarizeWork(dir, base) {
   return summary;
 }
 
+// src/core/process.ts
+async function terminateChild(child, graceMs = 3e3, killMs = 3e3) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise((resolve2, reject) => {
+    let grace;
+    let deadline;
+    const finish = (err) => {
+      clearTimeout(grace);
+      clearTimeout(deadline);
+      child.off("exit", exited);
+      child.off("error", failed);
+      if (err) reject(err);
+      else resolve2();
+    };
+    const exited = () => finish();
+    const failed = (err) => finish(err);
+    child.once("exit", exited);
+    child.once("error", failed);
+    grace = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch (err) {
+        finish(err);
+        return;
+      }
+      deadline = setTimeout(() => finish(new Error("provider exit was not observed after SIGKILL; ownership is retained")), killMs);
+      deadline.unref();
+    }, graceMs);
+    grace.unref();
+    try {
+      child.stdin.end();
+      child.kill("SIGTERM");
+    } catch (err) {
+      finish(err);
+    }
+  });
+}
+
 // src/providers/claude/adapter.ts
 import { spawn } from "node:child_process";
 import * as readline3 from "node:readline";
-import { randomUUID } from "node:crypto";
+import { randomUUID as randomUUID2 } from "node:crypto";
 var log = createLogger("claude-adapter");
 function rec(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : void 0;
@@ -452,7 +577,7 @@ var ClaudeCliAdapter = class {
   }
   /* ── lifecycle ───────────────────────────────────────────────────────── */
   async start(opts) {
-    const sessionId = randomUUID();
+    const sessionId = randomUUID2();
     await this.launch(opts, ["--session-id", sessionId]);
     this.sessionId = sessionId;
     return { sessionId, ...this._actualModel !== void 0 ? { actualModel: this._actualModel } : {} };
@@ -532,38 +657,8 @@ var ClaudeCliAdapter = class {
     });
   }
   async dispose() {
-    if (this.disposed) return;
     this.disposed = true;
-    const child = this.child;
-    if (!child) return;
-    try {
-      child.stdin.end();
-    } catch {
-    }
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    await new Promise((resolve2) => {
-      let settled = false;
-      const done = () => {
-        if (settled) return;
-        settled = true;
-        resolve2();
-      };
-      child.once("exit", done);
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        done();
-        return;
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-        }
-        done();
-      }, 3e3);
-      timer.unref?.();
-    });
+    if (this.child) await terminateChild(this.child);
   }
   /* ── turns ───────────────────────────────────────────────────────────── */
   async startTurn(text) {
@@ -932,7 +1027,8 @@ var CodexAppServerAdapter = class {
   nextId = 1;
   pending = /* @__PURE__ */ new Map();
   parked = /* @__PURE__ */ new Map();
-  turnEndWaiters = [];
+  completedTurns = /* @__PURE__ */ new Set();
+  interruptTimeoutMs = 3e4;
   exitError;
   /** Text of the most recent completed agentMessage; becomes the turn's final. */
   lastAgentMessage;
@@ -1014,36 +1110,8 @@ var CodexAppServerAdapter = class {
     });
   }
   async dispose() {
-    if (this.disposed) return;
     this.disposed = true;
-    const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
-      this.failAll(new Error("codex app-server disposed"));
-      return;
-    }
-    await new Promise((resolve2) => {
-      let settled = false;
-      const done = () => {
-        if (settled) return;
-        settled = true;
-        resolve2();
-      };
-      child.once("exit", done);
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        done();
-        return;
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-        }
-        done();
-      }, 3e3);
-      timer.unref?.();
-    });
+    if (this.child) await terminateChild(this.child);
     this.failAll(new Error("codex app-server disposed"));
   }
   /* ── turns ───────────────────────────────────────────────────────────── */
@@ -1081,44 +1149,58 @@ var CodexAppServerAdapter = class {
     const threadId = this.threadId;
     const turnId = this._turnId;
     if (threadId === void 0 || turnId === void 0) return;
-    const ended = this.waitForTurnEnd();
     try {
-      await this.request("turn/interrupt", { threadId, turnId }, 3e4);
+      await this.request("turn/interrupt", { threadId, turnId }, this.interruptTimeoutMs);
     } catch (err) {
-      log2.warn("turn/interrupt rejected:", err);
+      if (!this.completedTurns.has(turnId)) throw err;
     }
-    await Promise.race([ended, delay(3e4)]);
-    this._turnId = void 0;
+    const deadline = Date.now() + this.interruptTimeoutMs;
+    while (!this.completedTurns.has(turnId)) {
+      if (this.exitError) throw this.exitError;
+      if (Date.now() >= deadline) throw new Error(`interrupt of ${turnId} was not confirmed; the turn may still be running`);
+      await delay(10);
+    }
   }
   /** Answer a parked approval / user-input request with the manager's decision. */
   async respond(requestId, decision) {
     const parked = this.parked.get(requestId);
     if (!parked) throw new Error(`no pending codex request "${requestId}"`);
-    this.parked.delete(requestId);
-    const allow = decision.decision === "allow" || decision.decision === "answer";
+    if (parked.kind !== "userInput" && decision.decision === "answer") {
+      throw new Error("a permission request requires allow or deny");
+    }
+    const allow = decision.decision === "allow";
+    let message;
     switch (parked.kind) {
       case "commandExecution":
       case "fileChange":
-        this.write({ id: parked.id, result: { decision: allow ? "accept" : "decline" } });
-        return;
+        message = { id: parked.id, result: { decision: allow ? "accept" : "decline" } };
+        break;
       case "legacyExec":
       case "legacyPatch":
-        this.write({
-          id: parked.id,
-          result: {
-            decision: allow ? "approved" : { denied: { rejection: decision.text ?? "denied by the manager" } }
-          }
-        });
-        return;
+        message = { id: parked.id, result: { decision: allow ? "approved" : { denied: { rejection: decision.text ?? "denied by the manager" } } } };
+        break;
       case "userInput": {
-        const answers = {};
-        for (const qid of parked.questionIds ?? []) {
-          answers[qid] = { answers: [decision.text ?? ""] };
+        if (decision.decision === "deny") {
+          message = { id: parked.id, error: { code: -32e3, message: decision.text ?? "input denied by the manager" } };
+          break;
         }
-        this.write({ id: parked.id, result: { answers } });
-        return;
+        const ids = parked.questionIds ?? [];
+        const supplied = decision.answers ?? (ids.length === 1 && decision.text !== void 0 ? { [ids[0]]: [decision.text] } : void 0);
+        if (!supplied || ids.some((id) => !Array.isArray(supplied[id])) || Object.keys(supplied).some((id) => !ids.includes(id))) {
+          throw new Error(`answer every question using answers keyed by id: ${ids.join(", ")}`);
+        }
+        const answers = Object.fromEntries(ids.map((id) => [id, { answers: supplied[id] }]));
+        message = { id: parked.id, result: { answers } };
+        break;
       }
     }
+    const child = this.child;
+    if (!child || child.stdin.destroyed) throw new Error("codex app-server stdin is not writable");
+    await new Promise((resolve2, reject) => {
+      child.stdin.write(`${JSON.stringify(message)}
+`, (err) => err ? reject(err) : resolve2());
+    });
+    this.parked.delete(requestId);
   }
   /* ── subscriptions ───────────────────────────────────────────────────── */
   onRaw(cb) {
@@ -1269,7 +1351,11 @@ var CodexAppServerAdapter = class {
         if (!q) continue;
         const qid = str2(q["id"]);
         if (qid !== void 0) ids.push(qid);
-        prompts.push(`${str2(q["header"]) ?? ""} ${str2(q["question"]) ?? ""}`.trim());
+        const options = Array.isArray(q["options"]) ? q["options"].map((raw2) => {
+          const option = rec2(raw2);
+          return `${str2(option?.["label"]) ?? ""}: ${str2(option?.["description"]) ?? ""}`;
+        }) : [];
+        prompts.push(`[${qid ?? "?"}] ${str2(q["header"]) ?? ""} ${str2(q["question"]) ?? ""}${options.length ? "\n  " + options.join("\n  ") : ""}`.trim());
       }
       this.parked.set(requestId, { id, kind, questionIds: ids });
       this.emit({
@@ -1277,6 +1363,7 @@ var CodexAppServerAdapter = class {
         type: "question",
         rawType: method,
         text: prompts.join("\n") || "the worker asked a question",
+        data: { questions },
         requestId,
         ...this._turnId !== void 0 ? { turnId: this._turnId } : {}
       });
@@ -1306,6 +1393,10 @@ var CodexAppServerAdapter = class {
         return;
       }
       case "turn/completed": {
+        const completedId = str2(rec2(p["turn"])?.["id"]) ?? turnId;
+        if (completedId !== void 0) this.completedTurns.add(completedId);
+        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.values().next().value);
+        if (this._turnId !== void 0 && completedId !== this._turnId) return;
         const status = str2(rec2(p["turn"])?.["status"]) ?? "completed";
         if (this.lastAgentMessage !== void 0 && status !== "interrupted") {
           this.emit({ ts, type: "final", rawType: method, text: this.lastAgentMessage, ...withTurn });
@@ -1313,7 +1404,6 @@ var CodexAppServerAdapter = class {
         this.lastAgentMessage = void 0;
         this.emit({ ts, type: "turn_completed", rawType: method, text: `turn ${status}`, ...withTurn, data: { status } });
         this._turnId = void 0;
-        this.resolveTurnEnd();
         return;
       }
       case "turn/plan/updated": {
@@ -1360,7 +1450,6 @@ var CodexAppServerAdapter = class {
           this.emit({ ts, type: "turn_completed", rawType: method, text: "turn failed", ...withTurn, data: { status: "failed" } });
           this._turnId = void 0;
           this.lastAgentMessage = void 0;
-          this.resolveTurnEnd();
         }
         return;
       }
@@ -1415,21 +1504,11 @@ var CodexAppServerAdapter = class {
       this.emit({ ts, type: "status", rawType: method, text: "reasoning", ...withTurn });
     }
   }
-  waitForTurnEnd() {
-    if (this._turnId === void 0) return Promise.resolve();
-    return new Promise((resolve2) => this.turnEndWaiters.push(resolve2));
-  }
-  resolveTurnEnd() {
-    const waiters = this.turnEndWaiters;
-    this.turnEndWaiters = [];
-    for (const resolve2 of waiters) resolve2();
-  }
   failAll(error) {
     if (!this.exitError) this.exitError = error;
     const pending = Array.from(this.pending.values());
     this.pending.clear();
     for (const p of pending) p.reject(error);
-    this.resolveTurnEnd();
   }
 };
 function describeApproval(kind, params) {
@@ -1469,6 +1548,8 @@ var Supervisor = class {
   seq = 0;
   interruptRequested = false;
   stopping = false;
+  shutdownTask;
+  controlChain = Promise.resolve();
   queued = [];
   approvalTimers = /* @__PURE__ */ new Map();
   /** Most recent `final` text, kept for `worker_result`. */
@@ -1511,7 +1592,18 @@ var Supervisor = class {
   /* ── boot ────────────────────────────────────────────────────────────── */
   async run() {
     await ensureDirs(this.spec.workerId);
+    const own = await acquireSupervisorLock(this.spec.workerId);
+    if ("heldBy" in own) {
+      log3.error(`another supervisor (pid ${own.heldBy.pid}) already owns worker ${this.spec.workerId}`);
+      process.exit(3);
+    }
+    this.supervisorLock = own.lock;
     const prior = await readRecord(this.spec.workerId);
+    if (prior && prior.owner.clientId !== (this.spec.expectedOwnerClientId ?? this.spec.owner.clientId)) {
+      await this.supervisorLock.release();
+      throw new Error("worker ownership changed before startup; read its current owner and retry explicitly");
+    }
+    await writeJsonAtomic(path2.join(this.record.paths.dir, "spec.json"), this.spec);
     if (prior !== void 0) {
       const journalSeq = await lastJournalSeq(this.record.paths.journal);
       this.seq = Math.max(prior.lastSeq, journalSeq);
@@ -1527,12 +1619,6 @@ var Supervisor = class {
         for (const f of snapshot.changedFiles) this.touchedFiles.add(f);
       }
     }
-    const own = await acquireSupervisorLock(this.spec.workerId);
-    if ("heldBy" in own) {
-      log3.error(`another supervisor (pid ${own.heldBy.pid}) already owns worker ${this.spec.workerId}`);
-      process.exit(3);
-    }
-    this.supervisorLock = own.lock;
     if (this.spec.writeAccess) {
       const dir = this.spec.worktree?.path ?? this.spec.cwd;
       const claim = await acquireWriteLock(dir, this.spec.workerId);
@@ -1544,6 +1630,7 @@ var Supervisor = class {
         return;
       }
       this.writeLock = claim.lock;
+      this.record.startingHead = prior !== void 0 ? prior.startingHead : await resolveCommit(dir, "HEAD");
     }
     await this.persist();
     this.server = await serveControl(this.record.paths.socket, (req) => this.handleControl(req));
@@ -1676,6 +1763,12 @@ var Supervisor = class {
   }
   /* ── control ops ─────────────────────────────────────────────────────── */
   async handleControl(request) {
+    if (request.op === "status" || request.op === "collect") return this.applyControl(request);
+    const operation = this.controlChain.then(() => this.applyControl(request));
+    this.controlChain = operation.catch(() => void 0);
+    return operation;
+  }
+  async applyControl(request) {
     if (request.op === "status") return { ok: true, op: "status", record: this.record };
     if (request.op === "collect") {
       await this.snapshotResult();
@@ -1758,6 +1851,7 @@ var Supervisor = class {
     try {
       await this.adapter.interrupt();
     } catch (err) {
+      this.interruptRequested = false;
       return { ok: false, code: "provider_error", error: err instanceof Error ? err.message : String(err) };
     }
     this.record.turnId = void 0;
@@ -1796,20 +1890,22 @@ var Supervisor = class {
     if (index < 0) {
       return { ok: false, code: "bad_request", error: `no pending request "${requestId}" on this worker` };
     }
-    const [entry] = this.record.pending.splice(index, 1);
+    const entry = this.record.pending[index];
     this.clearApprovalTimer(requestId);
     try {
       await this.adapter.respond(requestId, decision);
     } catch (err) {
+      this.armApprovalTimer(requestId);
       return { ok: false, code: "provider_error", error: err instanceof Error ? err.message : String(err) };
     }
+    this.record.pending = this.record.pending.filter((p) => p.requestId !== requestId);
     await this.onEvent({
       ts: (/* @__PURE__ */ new Date()).toISOString(),
       type: "status",
       text: `manager ${decision.decision === "deny" ? "denied" : "answered"}: ${entry?.text ?? requestId}`,
       data: { requestId, decision: decision.decision }
     });
-    if (this.record.pending.length === 0) await this.setState("running");
+    if (this.record.pending.length === 0 && this.record.state === "blocked") await this.setState("running");
     return { ok: true, op: "respond", record: this.record };
   }
   /* ── approval timeouts ───────────────────────────────────────────────── */
@@ -1821,18 +1917,14 @@ var Supervisor = class {
         this.approvalTimers.delete(requestId);
         const index = this.record.pending.findIndex((p) => p.requestId === requestId);
         if (index < 0) return;
-        this.record.pending.splice(index, 1);
-        try {
-          await this.adapter.respond(requestId, { decision: "deny", text: "no answer from the manager in time" });
-        } catch {
-        }
+        const response = await this.opRespond(requestId, { decision: "deny", text: "no answer from the manager in time" });
+        if (!response.ok) return;
         await this.onEvent({
           ts: (/* @__PURE__ */ new Date()).toISOString(),
           type: "permission_denied",
           text: `denied automatically: no manager answered within ${Math.round(ms / 1e3)}s`,
           data: { requestId, auto: true }
         });
-        if (this.record.pending.length === 0) await this.setState("running");
       })();
     }, ms);
     timer.unref?.();
@@ -1887,26 +1979,26 @@ var Supervisor = class {
     await this.teardown();
   }
   async shutdown(state) {
-    if (this.stopping) return;
+    if (this.shutdownTask) return this.shutdownTask;
     this.stopping = true;
-    this.record.state = state;
-    await this.snapshotResult();
-    await this.persist();
-    await this.teardown();
+    this.shutdownTask = (async () => {
+      await this.adapter.dispose();
+      this.record.state = state;
+      await this.snapshotResult();
+      await this.persist();
+      await this.teardown();
+    })();
+    try {
+      await this.shutdownTask;
+    } catch (err) {
+      this.shutdownTask = void 0;
+      throw err;
+    }
   }
   async teardown() {
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
-    for (const lock of [this.writeLock, this.supervisorLock]) {
-      try {
-        await lock?.release();
-      } catch {
-      }
-    }
-    try {
-      await this.adapter.dispose();
-    } catch {
-    }
+    await this.adapter.dispose();
     try {
       this.server?.close();
     } catch {
@@ -1915,6 +2007,7 @@ var Supervisor = class {
       await fsp2.rm(this.record.paths.socket, { force: true });
     } catch {
     }
+    for (const lock of [this.writeLock, this.supervisorLock]) await lock?.release();
     setTimeout(() => process.exit(0), 150).unref?.();
   }
   /* ── results ─────────────────────────────────────────────────────────── */
@@ -1923,10 +2016,12 @@ var Supervisor = class {
     const result = await this.buildResult();
     try {
       await writeJsonAtomic(this.record.paths.result, result);
-      if (result.final !== void 0) await fsp2.writeFile(this.record.paths.final, result.final, "utf8");
+      if (result.final !== void 0) await fsp2.writeFile(this.record.paths.final, result.final, { encoding: "utf8", mode: 384 });
       if (result.changedFiles.length > 0) {
         await fsp2.writeFile(this.record.paths.changedFiles, `${result.changedFiles.join("\n")}
-`, "utf8");
+`, { encoding: "utf8", mode: 384 });
+      } else {
+        await fsp2.rm(this.record.paths.changedFiles, { force: true });
       }
     } catch (err) {
       log3.warn("failed to write result artifacts:", err);
@@ -1939,13 +2034,16 @@ var Supervisor = class {
     let commit;
     if (this.record.writeAccess) {
       try {
-        const summary = await summarizeWork(dir, this.record.worktree?.base);
-        if (summary.changedFiles.length > 0) changedFiles = summary.changedFiles;
+        const summary = await summarizeWork(dir, this.record.startingHead);
+        if (await repoRoot(dir)) changedFiles = summary.changedFiles;
         if (summary.diffStat.length > 0) diffStat = summary.diffStat;
         if (summary.commit !== void 0) commit = summary.commit;
         if (summary.diff.length > 0) {
           this.latestDiff = summary.diff;
-          await fsp2.writeFile(this.record.paths.diff, summary.diff, "utf8");
+          await fsp2.writeFile(this.record.paths.diff, summary.diff, { encoding: "utf8", mode: 384 });
+        } else if (await repoRoot(dir)) {
+          this.latestDiff = void 0;
+          await fsp2.rm(this.record.paths.diff, { force: true });
         }
       } catch (err) {
         log3.warn("failed to summarize git work:", err);

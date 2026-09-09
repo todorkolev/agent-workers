@@ -3870,49 +3870,49 @@ var require_fast_uri = __commonJS({
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative2, options, skipNormalization) {
+    function resolveComponent(base, relative3, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
         base = parse3(serialize(base, options), options);
-        relative2 = parse3(serialize(relative2, options), options);
+        relative3 = parse3(serialize(relative3, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative2.scheme) {
-        target.scheme = relative2.scheme;
-        target.userinfo = relative2.userinfo;
-        target.host = relative2.host;
-        target.port = relative2.port;
-        target.path = removeDotSegments(relative2.path || "");
-        target.query = relative2.query;
+      if (!options.tolerant && relative3.scheme) {
+        target.scheme = relative3.scheme;
+        target.userinfo = relative3.userinfo;
+        target.host = relative3.host;
+        target.port = relative3.port;
+        target.path = removeDotSegments(relative3.path || "");
+        target.query = relative3.query;
       } else {
-        if (relative2.userinfo !== void 0 || relative2.host !== void 0 || relative2.port !== void 0) {
-          target.userinfo = relative2.userinfo;
-          target.host = relative2.host;
-          target.port = relative2.port;
-          target.path = removeDotSegments(relative2.path || "");
-          target.query = relative2.query;
+        if (relative3.userinfo !== void 0 || relative3.host !== void 0 || relative3.port !== void 0) {
+          target.userinfo = relative3.userinfo;
+          target.host = relative3.host;
+          target.port = relative3.port;
+          target.path = removeDotSegments(relative3.path || "");
+          target.query = relative3.query;
         } else {
-          if (!relative2.path) {
+          if (!relative3.path) {
             target.path = base.path;
-            if (relative2.query !== void 0) {
-              target.query = relative2.query;
+            if (relative3.query !== void 0) {
+              target.query = relative3.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative2.path[0] === "/") {
-              target.path = removeDotSegments(relative2.path);
+            if (relative3.path[0] === "/") {
+              target.path = removeDotSegments(relative3.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative2.path;
+                target.path = "/" + relative3.path;
               } else if (!base.path) {
-                target.path = relative2.path;
+                target.path = relative3.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative2.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative3.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative2.query;
+            target.query = relative3.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3920,7 +3920,7 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative2.fragment;
+      target.fragment = relative3.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
@@ -21471,7 +21471,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 function stateDir() {
   const fromEnv = process.env["AGENT_WORKERS_HOME"];
   if (fromEnv && fromEnv.length > 0) return path.resolve(fromEnv);
@@ -21502,10 +21502,33 @@ function workerPaths(workerId) {
     socket: path.join(socketDir(), `${hash}.sock`)
   };
 }
+async function privateDir(dir) {
+  await fsp.mkdir(dir, { recursive: true, mode: 448 });
+  const stat2 = await fsp.lstat(dir);
+  if (!stat2.isDirectory() || process.getuid && stat2.uid !== process.getuid()) {
+    throw new Error(`state directory must be owned by the current user and cannot be a symlink: ${dir}`);
+  }
+  await fsp.chmod(dir, 448);
+}
 async function ensureDirs(workerId) {
-  await fsp.mkdir(path.join(stateDir(), "workers"), { recursive: true });
-  await fsp.mkdir(socketDir(), { recursive: true, mode: 448 });
-  if (workerId !== void 0) await fsp.mkdir(workerDir(workerId), { recursive: true });
+  await privateDir(stateDir());
+  await privateDir(path.join(stateDir(), "workers"));
+  await privateDir(socketDir());
+  if (workerId !== void 0) {
+    const dir = workerDir(workerId);
+    await privateDir(dir);
+    for (const name of await fsp.readdir(dir)) {
+      const file = path.join(dir, name);
+      const stat2 = await fsp.lstat(file).catch(() => void 0);
+      if (!stat2) continue;
+      if (!stat2.isFile() || process.getuid && stat2.uid !== process.getuid()) {
+        throw new Error(`unexpected ownership or file type in worker state: ${file}`);
+      }
+      await fsp.chmod(file, 384).catch((err) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    }
+  }
 }
 var tmpCounter = 0;
 async function writeJsonAtomic(file, value) {
@@ -21513,7 +21536,7 @@ async function writeJsonAtomic(file, value) {
   const tmp = `${file}.${process.pid}.${tmpCounter}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   try {
     await fsp.writeFile(tmp, `${JSON.stringify(value, null, 2)}
-`, "utf8");
+`, { encoding: "utf8", mode: 384, flag: "wx" });
     await fsp.rename(tmp, file);
   } catch (err) {
     await fsp.rm(tmp, { force: true }).catch(() => void 0);
@@ -21597,6 +21620,71 @@ async function canonical(p) {
     return path.resolve(p);
   }
 }
+async function arbitrate(action) {
+  await privateDir(stateDir());
+  const dir = path.join(stateDir(), "arbitration");
+  await privateDir(dir);
+  const id = randomUUID();
+  const file = path.join(dir, `${id}.json`);
+  const read = async (name) => {
+    const value = await readJson(path.join(dir, name));
+    if (value && !pidAlive(value.pid)) {
+      await fsp.rm(path.join(dir, name), { force: true });
+      return void 0;
+    }
+    return value;
+  };
+  const names = async () => (await fsp.readdir(dir)).filter((n) => n.endsWith(".json"));
+  await writeJsonAtomic(file, { pid: process.pid, choosing: true, number: 0 });
+  try {
+    let number3 = 1;
+    for (const name of await names()) number3 = Math.max(number3, ((await read(name))?.number ?? 0) + 1);
+    await writeJsonAtomic(file, { pid: process.pid, choosing: false, number: number3 });
+    const deadline = Date.now() + 3e4;
+    for (const name of await names()) {
+      if (name === `${id}.json`) continue;
+      for (; ; ) {
+        const other = await read(name);
+        if (!other || !other.choosing && (other.number > number3 || other.number === number3 && name > `${id}.json`)) break;
+        if (Date.now() >= deadline) throw new Error("timed out arbitrating worker ownership; retry the operation");
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
+    return await action();
+  } finally {
+    await fsp.rm(file, { force: true });
+  }
+}
+async function acquireSupervisorLock(workerId) {
+  const file = path.join(stateDir(), "locks", `supervisor-${createHash("sha256").update(workerId).digest("hex").slice(0, 20)}.lock`);
+  return arbitrate(() => acquireLock(file, workerId, workerId));
+}
+async function acquireLock(file, workerId, subject) {
+  await privateDir(path.dirname(file));
+  const payload = JSON.stringify({ workerId, pid: process.pid, subject, at: (/* @__PURE__ */ new Date()).toISOString() });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await fsp.open(file, "wx", 384);
+      await handle.writeFile(payload, "utf8");
+      await handle.close();
+      let released = false;
+      return { lock: { path: file, release: async () => {
+        if (released) return;
+        released = true;
+        await fsp.rm(file, { force: true });
+      } } };
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      const held = await readJson(file);
+      if (held !== void 0 && pidAlive(held.pid)) {
+        if (held.workerId !== workerId) return { heldBy: held };
+        return { heldBy: held };
+      }
+      await fsp.rm(file, { force: true });
+    }
+  }
+  throw new Error(`could not acquire the lock for ${subject}`);
+}
 async function purgeWorker(workerId) {
   const paths = workerPaths(workerId);
   await fsp.rm(paths.dir, { recursive: true, force: true });
@@ -21605,7 +21693,7 @@ async function purgeWorker(workerId) {
 
 // src/bridge/tools.ts
 import * as path5 from "node:path";
-import { createHash as createHash2, randomUUID } from "node:crypto";
+import { createHash as createHash2, randomUUID as randomUUID3 } from "node:crypto";
 
 // src/core/config.ts
 import * as path2 from "node:path";
@@ -21809,9 +21897,9 @@ async function ensureWorktree(req) {
   return { path: dir, branch, base: baseSha, created: !branchExists };
 }
 async function excludeFromRepo(repo, worktreeDir) {
-  const relative2 = path3.relative(repo, worktreeDir);
-  if (relative2.startsWith("..") || path3.isAbsolute(relative2)) return;
-  const topSegment = relative2.split(path3.sep)[0];
+  const relative3 = path3.relative(repo, worktreeDir);
+  if (relative3.startsWith("..") || path3.isAbsolute(relative3)) return;
+  const topSegment = relative3.split(path3.sep)[0];
   if (topSegment === void 0 || topSegment.length === 0) return;
   const entry = `${topSegment}/`;
   const gitDir = await git(repo, ["rev-parse", "--git-common-dir"]);
@@ -21902,6 +21990,7 @@ var DEFAULT_TRANSCRIPT_MODE = "activity";
 
 // src/bridge/registry.ts
 import { spawn } from "node:child_process";
+import { randomUUID as randomUUID2 } from "node:crypto";
 import * as fs3 from "node:fs";
 import * as os2 from "node:os";
 import * as path4 from "node:path";
@@ -21991,7 +22080,7 @@ function supervisorEntry() {
 async function spawnSupervisor(spec) {
   await ensureDirs(spec.workerId);
   const paths = workerPaths(spec.workerId);
-  const specPath = path4.join(paths.dir, "spec.json");
+  const specPath = path4.join(paths.dir, `launch-${randomUUID2()}.json`);
   await writeJsonAtomic(specPath, spec);
   const entry = supervisorEntry();
   if (!fs3.existsSync(entry)) {
@@ -21999,7 +22088,8 @@ async function spawnSupervisor(spec) {
       `supervisor bundle not found at ${entry}. Run "npm run build", or set AGENT_WORKERS_SUPERVISOR.`
     );
   }
-  const logFd = fs3.openSync(paths.supervisorLog, "a");
+  const logFd = fs3.openSync(paths.supervisorLog, "a", 384);
+  fs3.fchmodSync(logFd, 384);
   const child = spawn(process.execPath, [entry, "--spec", specPath], {
     detached: true,
     stdio: ["ignore", logFd, logFd],
@@ -22261,6 +22351,7 @@ var respondSchema = {
   workerId: external_exports.string(),
   requestId: external_exports.string().describe("From the permission_request or question event."),
   decision: external_exports.enum(["allow", "deny", "answer"]),
+  answers: external_exports.record(external_exports.array(external_exports.string())).optional().describe("For multiple questions: answers keyed by the question IDs shown in worker_read. Supply every question ID."),
   text: external_exports.string().optional().describe("The answer, or the reason for a denial."),
   takeover: external_exports.boolean().optional()
 };
@@ -22290,7 +22381,7 @@ function owner(ctx) {
 }
 function deriveWorkerId(provider, task) {
   const slug = task.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").split("-").slice(0, 4).join("-").slice(0, 32);
-  const suffix = randomUUID().slice(0, 6);
+  const suffix = randomUUID3().slice(0, 6);
   return `${provider}-${slug.length > 0 ? `${slug}-` : ""}${suffix}`;
 }
 async function needWorker(workerId) {
@@ -22319,6 +22410,9 @@ async function workerStart(ctx, input) {
   const provider = input.provider;
   const workerId = input.workerId ?? deriveWorkerId(provider, input.task);
   const existing = await resolveWorker(workerId);
+  if (existing && existing.record.owner.clientId !== ctx.clientId) {
+    return fail(`not_owner: worker "${workerId}" belongs to ${existing.record.owner.clientId}. Use worker_resume with explicit takeover or choose a new workerId.`);
+  }
   if (existing !== void 0 && !isTerminalState(existing.record.state) && existing.alive) {
     return fail(
       `Worker "${workerId}" already exists and is ${existing.record.state}. Use worker_send to talk to it, or pick a different workerId.`
@@ -22360,6 +22454,10 @@ ${availability.recovery ?? ""}`.trim());
     const root = await repoRoot(cwd);
     if (root === void 0) {
       return fail(`${cwd} is not inside a git repository, so a worktree cannot be created.`);
+    }
+    const planned = path5.resolve(input.worktreePath ?? path5.join(root, ".worktrees", `aw-${workerId}`));
+    if ((profile.launcher?.length ?? 0) > 0 && (toTargetPath(profile, root) !== root || toTargetPath(profile, planned) !== planned)) {
+      return fail("Worktree creation/adoption with different host and target paths is unsupported: Git records absolute metadata paths. Run the MCP bridge and providers inside the same container namespace, or mount the repository and worktrees at identical paths. No worktree was created.");
     }
     try {
       const info = await ensureWorktree({
@@ -22408,6 +22506,7 @@ ${availability.recovery ?? ""}`.trim());
     ...worktree !== void 0 ? { worktree } : {},
     owner: owner(ctx),
     version: ctx.version,
+    ...existing ? { expectedOwnerClientId: existing.record.owner.clientId } : {},
     approvalTimeoutMs: 15 * 60 * 1e3
   };
   let supervisorPid;
@@ -22592,6 +22691,9 @@ async function workerInterrupt(ctx, input) {
 async function workerStop(ctx, input) {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
+  if (found.record.owner.clientId !== ctx.clientId && input.takeover !== true) {
+    return fail(`not_owner: worker "${input.workerId}" is controlled by ${found.record.owner.host} (client ${found.record.owner.clientId}). Use takeover: true to take control explicitly.`);
+  }
   if (found.alive) {
     const response = await callSupervisor(
       found.record,
@@ -22601,9 +22703,21 @@ async function workerStop(ctx, input) {
     if (!response.ok) {
       return controlFailure(found.record, response);
     }
-  } else if (input.purge !== true) {
-    const stopped = { ...found.record, state: "stopped", updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
-    await writeJsonAtomic(found.record.paths.record, stopped).catch(() => void 0);
+  } else {
+    const claim = await acquireSupervisorLock(input.workerId);
+    if ("heldBy" in claim) return fail("A supervisor is starting or stopping this worker; retry after it settles.");
+    try {
+      const latest = await resolveWorker(input.workerId);
+      if (latest && latest.record.owner.clientId !== ctx.clientId && input.takeover !== true) return fail("not_owner: worker ownership changed; read its current owner before retrying.");
+      if (input.purge === true) {
+        await purgeWorker(input.workerId);
+        return ok(`Worker "${input.workerId}" was stopped and its artifacts deleted.`);
+      }
+      const stopped = { ...latest?.record ?? found.record, owner: owner(ctx), state: "stopped", updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+      await writeJsonAtomic(found.record.paths.record, stopped);
+    } finally {
+      await claim.lock.release();
+    }
   }
   if (input.purge === true) {
     for (let i = 0; i < 40; i += 1) {
@@ -22617,7 +22731,15 @@ async function workerStop(ctx, input) {
         `Worker "${input.workerId}" is still running (pid ${still.record.supervisorPid}); nothing was deleted. Try worker_stop again, or kill that process first.`
       );
     }
-    await purgeWorker(input.workerId);
+    const claim = await acquireSupervisorLock(input.workerId);
+    if ("heldBy" in claim) return fail("A supervisor resumed this worker before purge; nothing was deleted.");
+    try {
+      const latest = await resolveWorker(input.workerId);
+      if (latest && latest.record.owner.clientId !== ctx.clientId && input.takeover !== true) return fail("not_owner: ownership changed before purge; nothing was deleted.");
+      await purgeWorker(input.workerId);
+    } finally {
+      await claim.lock.release();
+    }
     return ok(`Worker "${input.workerId}" was stopped and its artifacts deleted.`);
   }
   const after = await resolveWorker(input.workerId);
@@ -22638,7 +22760,7 @@ async function workerRespond(ctx, input) {
       `"${input.requestId}" is a permission request, not a question. Answer it with decision: "allow" or decision: "deny" (text is kept as the reason).`
     );
   }
-  if (pending?.kind === "question" && input.decision === "allow" && input.text === void 0) {
+  if (pending?.kind === "question" && input.decision !== "deny" && input.text === void 0 && input.answers === void 0) {
     return fail(`"${input.requestId}" is a question. Answer it with decision: "answer" and the text.`);
   }
   const response = await callSupervisor(found.record, {
@@ -22646,7 +22768,8 @@ async function workerRespond(ctx, input) {
     requestId: input.requestId,
     decision: {
       decision: input.decision,
-      ...input.text !== void 0 ? { text: input.text } : {}
+      ...input.text !== void 0 ? { text: input.text } : {},
+      ...input.answers !== void 0 ? { answers: input.answers } : {}
     },
     owner: owner(ctx),
     ...input.takeover === true ? { takeover: true } : {}
@@ -22664,7 +22787,10 @@ async function workerResume(ctx, input) {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
   const record2 = found.record;
-  if (found.alive && !isTerminalState(record2.state)) {
+  if (record2.owner.clientId !== ctx.clientId && input.takeover !== true) {
+    return fail(`not_owner: worker "${input.workerId}" is controlled by ${record2.owner.host} (client ${record2.owner.clientId}). Use takeover: true to take control explicitly.`);
+  }
+  if (found.alive) {
     const response = await callSupervisor(record2, {
       op: "resume",
       ...input.task !== void 0 ? { task: input.task } : {},
@@ -22695,6 +22821,7 @@ async function workerResume(ctx, input) {
     resumeSessionId: record2.sessionId,
     owner: owner(ctx),
     // An empty task means "reattach only" - the supervisor starts no turn.
+    expectedOwnerClientId: record2.owner.clientId,
     task: input.task ?? ""
   };
   let resumedPid;
@@ -22784,7 +22911,7 @@ function deriveClientId(host, projectDir) {
 }
 
 // src/bridge/main.ts
-var VERSION = true ? "0.1.0" : "0.0.0-dev";
+var VERSION = true ? "0.1.1" : "0.0.0-dev";
 var log2 = createLogger("bridge");
 function detectHost() {
   if (process.env["CLAUDE_PLUGIN_ROOT"] || process.env["CLAUDE_PROJECT_DIR"] || process.env["CLAUDECODE"]) {

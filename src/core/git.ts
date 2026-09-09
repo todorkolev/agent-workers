@@ -248,7 +248,7 @@ export async function summarizeWork(dir: string, base: string | undefined): Prom
   if (head.code === 0 && head.stdout.includes("\0")) {
     const [sha, subject] = head.stdout.trim().split("\0");
     // Only report a commit when the worker actually moved HEAD past its base.
-    if (sha !== undefined && sha !== base) {
+    if (base !== undefined && sha !== undefined && sha !== base) {
       summary.commit = {
         sha,
         subject: subject ?? "",

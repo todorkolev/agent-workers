@@ -23,7 +23,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { WorkerPaths, WorkerRecord } from "./types.ts";
 
 /** Root of all worker state. Override with `AGENT_WORKERS_HOME`. */
@@ -69,10 +69,34 @@ export function workerPaths(workerId: string): WorkerPaths {
 }
 
 /** Create the state directories. Sockets are only readable by the owner. */
+export async function privateDir(dir: string): Promise<void> {
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  const stat = await fsp.lstat(dir);
+  if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) {
+    throw new Error(`state directory must be owned by the current user and cannot be a symlink: ${dir}`);
+  }
+  await fsp.chmod(dir, 0o700);
+}
+
 export async function ensureDirs(workerId?: string): Promise<void> {
-  await fsp.mkdir(path.join(stateDir(), "workers"), { recursive: true });
-  await fsp.mkdir(socketDir(), { recursive: true, mode: 0o700 });
-  if (workerId !== undefined) await fsp.mkdir(workerDir(workerId), { recursive: true });
+  await privateDir(stateDir());
+  await privateDir(path.join(stateDir(), "workers"));
+  await privateDir(socketDir());
+  if (workerId !== undefined) {
+    const dir = workerDir(workerId);
+    await privateDir(dir);
+    for (const name of await fsp.readdir(dir)) {
+      const file = path.join(dir, name);
+      const stat = await fsp.lstat(file).catch(() => undefined);
+      if (!stat) continue;
+      if (!stat.isFile() || (process.getuid && stat.uid !== process.getuid())) {
+        throw new Error(`unexpected ownership or file type in worker state: ${file}`);
+      }
+      await fsp.chmod(file, 0o600).catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+      });
+    }
+  }
 }
 
 /* ── atomic json ───────────────────────────────────────────────────────── */
@@ -92,7 +116,7 @@ export async function writeJsonAtomic(file: string, value: unknown): Promise<voi
   tmpCounter += 1;
   const tmp = `${file}.${process.pid}.${tmpCounter}.${Math.random().toString(36).slice(2, 8)}.tmp`;
   try {
-    await fsp.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await fsp.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
     await fsp.rename(tmp, file);
   } catch (err) {
     await fsp.rm(tmp, { force: true }).catch(() => undefined);
@@ -133,7 +157,7 @@ export function appendLine(file: string, value: unknown): void {
     line = `${JSON.stringify({ unserializable: String(value) })}\n`;
   }
   try {
-    fs.appendFileSync(file, line, "utf8");
+    fs.appendFileSync(file, line, { encoding: "utf8", mode: 0o600 });
   } catch {
     /* never let journaling kill the worker */
   }
@@ -142,7 +166,7 @@ export function appendLine(file: string, value: unknown): void {
 /** Append a raw text line (provider stderr, supervisor diagnostics). */
 export function appendText(file: string, text: string): void {
   try {
-    fs.appendFileSync(file, text.endsWith("\n") ? text : `${text}\n`, "utf8");
+    fs.appendFileSync(file, text.endsWith("\n") ? text : `${text}\n`, { encoding: "utf8", mode: 0o600 });
   } catch {
     /* ignore */
   }
@@ -276,6 +300,57 @@ function lockPath(canonicalDir: string): string {
 
 export type WriteLock = { path: string; release: () => Promise<void> };
 
+/** Filesystem bakery mutex: every contender writes only its unique ticket.
+ * Atomic publication avoids an empty-lock window; dead contenders can be
+ * removed without ever unlinking a replacement owner's lock at the same path.
+ * Held only for claim arbitration, not for the worker's lifetime.
+ */
+async function arbitrate<T>(action: () => Promise<T>): Promise<T> {
+  await privateDir(stateDir());
+  const dir = path.join(stateDir(), "arbitration");
+  await privateDir(dir);
+  const id = randomUUID();
+  const file = path.join(dir, `${id}.json`);
+  type Ticket = { pid: number; choosing: boolean; number: number };
+  const read = async (name: string): Promise<Ticket | undefined> => {
+    const value = await readJson<Ticket>(path.join(dir, name));
+    if (value && !pidAlive(value.pid)) {
+      await fsp.rm(path.join(dir, name), { force: true });
+      return undefined;
+    }
+    return value;
+  };
+  const names = async () => (await fsp.readdir(dir)).filter(n => n.endsWith(".json"));
+  await writeJsonAtomic(file, { pid: process.pid, choosing: true, number: 0 });
+  try {
+    let number = 1;
+    for (const name of await names()) number = Math.max(number, ((await read(name))?.number ?? 0) + 1);
+    await writeJsonAtomic(file, { pid: process.pid, choosing: false, number });
+    const deadline = Date.now() + 30_000;
+    for (const name of await names()) {
+      if (name === `${id}.json`) continue;
+      for (;;) {
+        const other = await read(name);
+        if (!other || (!other.choosing && (other.number > number ||
+            (other.number === number && name > `${id}.json`)))) break;
+        if (Date.now() >= deadline) throw new Error("timed out arbitrating worker ownership; retry the operation");
+        await new Promise(r => setTimeout(r, 10));
+      }
+    }
+    return await action();
+  } finally {
+    await fsp.rm(file, { force: true });
+  }
+}
+
+export function pathsOverlap(a: string, b: string): boolean {
+  const inside = (parent: string, child: string) => {
+    const relative = path.relative(parent, child);
+    return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  };
+  return inside(a, b) || inside(b, a);
+}
+
 /**
  * Take the lock for `writeDir`, or return the record of who holds it.
  *
@@ -286,7 +361,17 @@ export async function acquireWriteLock(
   writeDir: string,
   workerId: string,
 ): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
-  return acquireLock(lockPath(await canonical(writeDir)), workerId, await canonical(writeDir));
+  const target = await canonical(writeDir);
+  return arbitrate(async () => {
+    const dir = path.join(stateDir(), "locks");
+    await privateDir(dir);
+    for (const name of await fsp.readdir(dir)) {
+      if (!name.endsWith(".lock") || name.startsWith("supervisor-")) continue;
+      const held = await readJson<{ workerId: string; pid: number; subject: string }>(path.join(dir, name));
+      if (held && pidAlive(held.pid) && pathsOverlap(target, held.subject)) return { heldBy: held };
+    }
+    return acquireLock(lockPath(target), workerId, target);
+  });
 }
 
 /**
@@ -298,7 +383,7 @@ export async function acquireSupervisorLock(
   workerId: string,
 ): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
   const file = path.join(stateDir(), "locks", `supervisor-${createHash("sha256").update(workerId).digest("hex").slice(0, 20)}.lock`);
-  return acquireLock(file, workerId, workerId);
+  return arbitrate(() => acquireLock(file, workerId, workerId));
 }
 
 async function acquireLock(
@@ -306,21 +391,26 @@ async function acquireLock(
   workerId: string,
   subject: string,
 ): Promise<{ lock: WriteLock } | { heldBy: { workerId: string; pid: number } }> {
-  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await privateDir(path.dirname(file));
   const payload = JSON.stringify({ workerId, pid: process.pid, subject, at: new Date().toISOString() });
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const handle = await fsp.open(file, "wx");
+      const handle = await fsp.open(file, "wx", 0o600);
       await handle.writeFile(payload, "utf8");
       await handle.close();
-      return { lock: { path: file, release: async () => fsp.rm(file, { force: true }).then(() => undefined) } };
+      let released = false;
+      return { lock: { path: file, release: async () => {
+        if (released) return;
+        released = true;
+        await fsp.rm(file, { force: true });
+      } } };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       const held = await readJson<{ workerId: string; pid: number }>(file);
       // A lock held by *this* worker id from a previous run is ours to reclaim;
       // one held by a different, still-live worker is not.
-      if (held !== undefined && pidAlive(held.pid) && held.pid !== process.pid) {
+      if (held !== undefined && pidAlive(held.pid)) {
         if (held.workerId !== workerId) return { heldBy: held };
         return { heldBy: held };
       }

@@ -1,6 +1,6 @@
 {
   "name": "agent-workers",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Persistent, interactive Claude and Codex workers, driven from either Claude Code or Codex through one MCP tool contract.",

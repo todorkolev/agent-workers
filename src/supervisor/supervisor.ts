@@ -16,6 +16,7 @@
 
 import type { Server } from "node:net";
 import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import {
   acquireSupervisorLock,
   acquireWriteLock,
@@ -29,7 +30,7 @@ import {
   type WriteLock,
 } from "../core/store.ts";
 import { serveControl, type ControlRequest, type ControlResponse } from "../core/control.ts";
-import { summarizeWork } from "../core/git.ts";
+import { repoRoot, resolveCommit, summarizeWork } from "../core/git.ts";
 import { createLogger } from "../core/logger.ts";
 import type {
   ProviderAdapter,
@@ -71,6 +72,8 @@ export class Supervisor {
   private seq = 0;
   private interruptRequested = false;
   private stopping = false;
+  private shutdownTask: Promise<void> | undefined;
+  private controlChain: Promise<unknown> = Promise.resolve();
   private readonly queued: QueuedSend[] = [];
   private readonly approvalTimers = new Map<string, NodeJS.Timeout>();
   /** Most recent `final` text, kept for `worker_result`. */
@@ -116,12 +119,23 @@ export class Supervisor {
 
   async run(): Promise<void> {
     await ensureDirs(this.spec.workerId);
+    const own = await acquireSupervisorLock(this.spec.workerId);
+    if ("heldBy" in own) {
+      log.error(`another supervisor (pid ${own.heldBy.pid}) already owns worker ${this.spec.workerId}`);
+      process.exit(3);
+    }
+    this.supervisorLock = own.lock;
 
     // Continue an existing worker's history rather than starting a new one on
     // top of it. The journal is append-only and `seq` is the manager's cursor:
     // restarting at 0 after a resume would append duplicate sequence numbers,
     // and every cursor the manager holds would then point at the wrong event.
     const prior = await readRecord(this.spec.workerId);
+    if (prior && prior.owner.clientId !== (this.spec.expectedOwnerClientId ?? this.spec.owner.clientId)) {
+      await this.supervisorLock.release();
+      throw new Error("worker ownership changed before startup; read its current owner and retry explicitly");
+    }
+    await writeJsonAtomic(path.join(this.record.paths.dir, "spec.json"), this.spec);
     if (prior !== undefined) {
       // The journal, not the checkpoint, is the authority. Events are appended
       // before `lastSeq` is persisted, so a crash in that window leaves the
@@ -146,13 +160,6 @@ export class Supervisor {
     // Claim the worker id first. Two concurrent resumes would otherwise both
     // probe the dead socket, both remove it, and both bind - putting two
     // processes on one provider session, one journal and one socket path.
-    const own = await acquireSupervisorLock(this.spec.workerId);
-    if ("heldBy" in own) {
-      log.error(`another supervisor (pid ${own.heldBy.pid}) already owns worker ${this.spec.workerId}`);
-      process.exit(3);
-    }
-    this.supervisorLock = own.lock;
-
     // Claim the directory before anything can edit it. The bridge's scan for a
     // conflicting writer happens before this process exists, so on its own it is
     // check-then-act: two starts racing each other both pass it.
@@ -167,6 +174,7 @@ export class Supervisor {
         return;
       }
       this.writeLock = claim.lock;
+      this.record.startingHead = prior !== undefined ? prior.startingHead : await resolveCommit(dir, "HEAD");
     }
 
     await this.persist();
@@ -333,6 +341,13 @@ export class Supervisor {
   /* ── control ops ─────────────────────────────────────────────────────── */
 
   private async handleControl(request: ControlRequest): Promise<ControlResponse> {
+    if (request.op === "status" || request.op === "collect") return this.applyControl(request);
+    const operation = this.controlChain.then(() => this.applyControl(request));
+    this.controlChain = operation.catch(() => undefined);
+    return operation;
+  }
+
+  private async applyControl(request: ControlRequest): Promise<ControlResponse> {
     if (request.op === "status") return { ok: true, op: "status", record: this.record };
     if (request.op === "collect") {
       await this.snapshotResult();
@@ -420,6 +435,7 @@ export class Supervisor {
     try {
       await this.adapter.interrupt();
     } catch (err) {
+      this.interruptRequested = false;
       return { ok: false, code: "provider_error", error: err instanceof Error ? err.message : String(err) };
     }
     this.record.turnId = undefined;
@@ -461,20 +477,22 @@ export class Supervisor {
     if (index < 0) {
       return { ok: false, code: "bad_request", error: `no pending request "${requestId}" on this worker` };
     }
-    const [entry] = this.record.pending.splice(index, 1);
+    const entry = this.record.pending[index];
     this.clearApprovalTimer(requestId);
     try {
       await this.adapter.respond(requestId, decision);
     } catch (err) {
+      this.armApprovalTimer(requestId);
       return { ok: false, code: "provider_error", error: err instanceof Error ? err.message : String(err) };
     }
+    this.record.pending = this.record.pending.filter(p => p.requestId !== requestId);
     await this.onEvent({
       ts: new Date().toISOString(),
       type: "status",
       text: `manager ${decision.decision === "deny" ? "denied" : "answered"}: ${entry?.text ?? requestId}`,
       data: { requestId, decision: decision.decision },
     });
-    if (this.record.pending.length === 0) await this.setState("running");
+    if (this.record.pending.length === 0 && this.record.state === "blocked") await this.setState("running");
     return { ok: true, op: "respond", record: this.record };
   }
 
@@ -488,19 +506,14 @@ export class Supervisor {
         this.approvalTimers.delete(requestId);
         const index = this.record.pending.findIndex((p) => p.requestId === requestId);
         if (index < 0) return;
-        this.record.pending.splice(index, 1);
-        try {
-          await this.adapter.respond(requestId, { decision: "deny", text: "no answer from the manager in time" });
-        } catch {
-          /* the provider may have withdrawn the request */
-        }
+        const response = await this.opRespond(requestId, { decision: "deny", text: "no answer from the manager in time" });
+        if (!response.ok) return;
         await this.onEvent({
           ts: new Date().toISOString(),
           type: "permission_denied",
           text: `denied automatically: no manager answered within ${Math.round(ms / 1000)}s`,
           data: { requestId, auto: true },
         });
-        if (this.record.pending.length === 0) await this.setState("running");
       })();
     }, ms);
     timer.unref?.();
@@ -566,29 +579,24 @@ export class Supervisor {
   }
 
   private async shutdown(state: WorkerState): Promise<void> {
-    if (this.stopping) return;
+    if (this.shutdownTask) return this.shutdownTask;
     this.stopping = true;
-    this.record.state = state;
-    await this.snapshotResult();
-    await this.persist();
-    await this.teardown();
+    this.shutdownTask = (async () => {
+      await this.adapter.dispose();
+      this.record.state = state;
+      await this.snapshotResult();
+      await this.persist();
+      await this.teardown();
+    })();
+    try { await this.shutdownTask; }
+    catch (err) { this.shutdownTask = undefined; throw err; }
   }
 
   private async teardown(): Promise<void> {
     for (const timer of this.approvalTimers.values()) clearTimeout(timer);
     this.approvalTimers.clear();
-    for (const lock of [this.writeLock, this.supervisorLock]) {
-      try {
-        await lock?.release();
-      } catch {
-        /* a stale lock is reclaimed by the next owner anyway */
-      }
-    }
-    try {
-      await this.adapter.dispose();
-    } catch {
-      /* best effort */
-    }
+    // Ownership remains held while the child can still write.
+    await this.adapter.dispose();
     try {
       this.server?.close();
     } catch {
@@ -599,6 +607,7 @@ export class Supervisor {
     } catch {
       /* best effort */
     }
+    for (const lock of [this.writeLock, this.supervisorLock]) await lock?.release();
     // Give the record write a moment to land before the process goes away.
     setTimeout(() => process.exit(0), 150).unref?.();
   }
@@ -610,9 +619,11 @@ export class Supervisor {
     const result = await this.buildResult();
     try {
       await writeJsonAtomic(this.record.paths.result, result);
-      if (result.final !== undefined) await fsp.writeFile(this.record.paths.final, result.final, "utf8");
+      if (result.final !== undefined) await fsp.writeFile(this.record.paths.final, result.final, { encoding: "utf8", mode: 0o600 });
       if (result.changedFiles.length > 0) {
-        await fsp.writeFile(this.record.paths.changedFiles, `${result.changedFiles.join("\n")}\n`, "utf8");
+        await fsp.writeFile(this.record.paths.changedFiles, `${result.changedFiles.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+      } else {
+        await fsp.rm(this.record.paths.changedFiles, { force: true });
       }
     } catch (err) {
       log.warn("failed to write result artifacts:", err);
@@ -629,13 +640,16 @@ export class Supervisor {
     // when the worker is not in a repository.
     if (this.record.writeAccess) {
       try {
-        const summary = await summarizeWork(dir, this.record.worktree?.base);
-        if (summary.changedFiles.length > 0) changedFiles = summary.changedFiles;
+        const summary = await summarizeWork(dir, this.record.startingHead);
+        if (await repoRoot(dir)) changedFiles = summary.changedFiles;
         if (summary.diffStat.length > 0) diffStat = summary.diffStat;
         if (summary.commit !== undefined) commit = summary.commit;
         if (summary.diff.length > 0) {
           this.latestDiff = summary.diff;
-          await fsp.writeFile(this.record.paths.diff, summary.diff, "utf8");
+          await fsp.writeFile(this.record.paths.diff, summary.diff, { encoding: "utf8", mode: 0o600 });
+        } else if (await repoRoot(dir)) {
+          this.latestDiff = undefined;
+          await fsp.rm(this.record.paths.diff, { force: true });
         }
       } catch (err) {
         log.warn("failed to summarize git work:", err);

@@ -110,6 +110,34 @@ through the same launcher and says so if it is missing.
 
 No container is created or managed here. Point a profile at one you already run.
 
+### Git worktrees across namespaces
+
+A mapped provider cwd does not translate the absolute `gitdir` and common Git
+metadata paths in a linked worktree. Creating or adopting a worktree with
+nonidentical host/target repository or worktree paths is therefore rejected
+before any worktree is created. Ordinary directory/read-only launcher use is
+supported, as is worktree use with identical paths visible in both environments.
+
+For a differently mounted repository, run the entire MCP server **inside** the
+existing container. Git, journals, supervisors and providers then share one
+namespace. Install both committed bundles inside it and configure the manager's
+MCP command like this (replace the container, user and paths):
+
+```json
+{
+  "command": "docker",
+  "args": ["exec", "-i", "--user", "node", "--workdir", "/workspaces/api",
+    "--env", "AGENT_WORKERS_PROJECT_DIR=/workspaces/api", "my-devcontainer",
+    "node", "/home/node/agent-workers/plugins/agent-workers/dist/agent-workers.mjs"]
+}
+```
+
+Use container paths in `worker_start`, including `cwd` and `worktreePath`, and
+use the local exec profile inside that server. Configure this instead of a
+second bridge for the same target. The container must already have Git, Node
+and logged-in provider CLIs. This also keeps all project Git execution inside
+the container when a repository requires it.
+
 ## Environment variables
 
 | variable | effect |
@@ -156,8 +184,8 @@ fix is `allowedTools` with the specific tools it needs — not
 which exists so that writing into a plain directory is a decision, never an
 omission.
 
-Two live write workers may never share a target. Enforcement is an atomic lock
-file under the state directory keyed by the canonical path, so:
+Two live write workers may never share a target. Claims are serialized under filesystem ticket arbitration, with canonical
+path containment checked before a write lock is published, so:
 
 - a race between two starts has exactly one winner;
 - `/repo` and `/repo/src` conflict, because they are the same files;

@@ -275,3 +275,17 @@ this MCP server when nested workers are disabled.
 
 These differences are surfaced, not hidden. `worker_send` reports the delivery
 mode it actually got, and `worker_respond` works where the backend supports it.
+
+## Follow-up protocol fixes
+
+Codex interrupt now requires the matching `turn/completed` notification. A
+rejected RPC or a missing terminal notification returns an error and preserves
+the active turn identity. It no longer reports cancellation on a timeout.
+
+Codex question events retain question IDs and options. For multiple questions,
+`worker_respond` takes `answers: { "question-id": ["selected option or text"] }`;
+all question IDs must be supplied. `text` remains supported for one question.
+The pending request remains retryable when writing its response fails.
+Both providers' stop paths now wait for an observed child exit after signalling.
+These failure branches are covered by scripted protocol regressions; live
+success-path measurements are recorded separately by the acceptance run.

@@ -30,6 +30,8 @@ export type SupervisorSpec = {
   providerArgs?: string[];
   worktree?: { path: string; branch: string; base: string; created: boolean };
   owner: WorkerOwner;
+  /** Owner observed by the bridge; checked again under the worker-id lock. */
+  expectedOwnerClientId?: string;
   version: string;
   /** Set to re-attach to an existing provider session instead of creating one. */
   resumeSessionId?: string;

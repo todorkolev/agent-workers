@@ -25,7 +25,7 @@ import {
 } from "../core/config.ts";
 import { probeProvider } from "../core/availability.ts";
 import { ensureWorktree, repoRoot } from "../core/git.ts";
-import { canonical, readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
+import { acquireSupervisorLock, canonical, readJson, readSince, purgeWorker, workerPaths, writeJsonAtomic } from "../core/store.ts";
 import {
   DEFAULT_TRANSCRIPT_MODE,
   isTerminalState,
@@ -169,6 +169,7 @@ export const respondSchema = {
   workerId: z.string(),
   requestId: z.string().describe("From the permission_request or question event."),
   decision: z.enum(["allow", "deny", "answer"]),
+  answers: z.record(z.array(z.string())).optional().describe("For multiple questions: answers keyed by the question IDs shown in worker_read. Supply every question ID."),
   text: z.string().optional().describe("The answer, or the reason for a denial."),
   takeover: z.boolean().optional(),
 };
@@ -270,6 +271,9 @@ export async function workerStart(
   const workerId = input.workerId ?? deriveWorkerId(provider, input.task);
 
   const existing = await resolveWorker(workerId);
+  if (existing && existing.record.owner.clientId !== ctx.clientId) {
+    return fail(`not_owner: worker "${workerId}" belongs to ${existing.record.owner.clientId}. Use worker_resume with explicit takeover or choose a new workerId.`);
+  }
   if (existing !== undefined && !isTerminalState(existing.record.state) && existing.alive) {
     return fail(
       `Worker "${workerId}" already exists and is ${existing.record.state}. ` +
@@ -331,6 +335,10 @@ export async function workerStart(
     if (root === undefined) {
       return fail(`${cwd} is not inside a git repository, so a worktree cannot be created.`);
     }
+    const planned = path.resolve(input.worktreePath ?? path.join(root, ".worktrees", `aw-${workerId}`));
+    if ((profile.launcher?.length ?? 0) > 0 && (toTargetPath(profile, root) !== root || toTargetPath(profile, planned) !== planned)) {
+      return fail("Worktree creation/adoption with different host and target paths is unsupported: Git records absolute metadata paths. Run the MCP bridge and providers inside the same container namespace, or mount the repository and worktrees at identical paths. No worktree was created.");
+    }
     try {
       const info = await ensureWorktree({
         repo: root,
@@ -384,6 +392,7 @@ export async function workerStart(
     ...(worktree !== undefined ? { worktree } : {}),
     owner: owner(ctx),
     version: ctx.version,
+    ...(existing ? { expectedOwnerClientId: existing.record.owner.clientId } : {}),
     approvalTimeoutMs: 15 * 60 * 1000,
   };
 
@@ -647,6 +656,9 @@ export async function workerStop(
 ): Promise<ToolOutput> {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
+  if (found.record.owner.clientId !== ctx.clientId && input.takeover !== true) {
+    return fail(`not_owner: worker "${input.workerId}" is controlled by ${found.record.owner.host} (client ${found.record.owner.clientId}). Use takeover: true to take control explicitly.`);
+  }
 
   if (found.alive) {
     // Generous: the supervisor snapshots git before it dies, and that can take
@@ -661,12 +673,19 @@ export async function workerStop(
       // and purging on top of it would delete the journal of a live worker.
       return controlFailure(found.record, response);
     }
-  } else if (input.purge !== true) {
-    // The supervisor is provably gone, so nothing owns this file any more and
-    // the bridge may close the record out. Without this, worker_status kept
-    // reporting `orphaned` after an explicit stop.
-    const stopped: WorkerRecord = { ...found.record, state: "stopped", updatedAt: new Date().toISOString() };
-    await writeJsonAtomic(found.record.paths.record, stopped).catch(() => undefined);
+  } else {
+    const claim = await acquireSupervisorLock(input.workerId);
+    if ("heldBy" in claim) return fail("A supervisor is starting or stopping this worker; retry after it settles.");
+    try {
+      const latest = await resolveWorker(input.workerId);
+      if (latest && latest.record.owner.clientId !== ctx.clientId && input.takeover !== true) return fail("not_owner: worker ownership changed; read its current owner before retrying.");
+      if (input.purge === true) {
+        await purgeWorker(input.workerId);
+        return ok(`Worker "${input.workerId}" was stopped and its artifacts deleted.`);
+      }
+      const stopped: WorkerRecord = { ...(latest?.record ?? found.record), owner: owner(ctx), state: "stopped", updatedAt: new Date().toISOString() };
+      await writeJsonAtomic(found.record.paths.record, stopped);
+    } finally { await claim.lock.release(); }
   }
 
   if (input.purge === true) {
@@ -684,7 +703,13 @@ export async function workerStop(
           "Try worker_stop again, or kill that process first.",
       );
     }
-    await purgeWorker(input.workerId);
+    const claim = await acquireSupervisorLock(input.workerId);
+    if ("heldBy" in claim) return fail("A supervisor resumed this worker before purge; nothing was deleted.");
+    try {
+      const latest = await resolveWorker(input.workerId);
+      if (latest && latest.record.owner.clientId !== ctx.clientId && input.takeover !== true) return fail("not_owner: ownership changed before purge; nothing was deleted.");
+      await purgeWorker(input.workerId);
+    } finally { await claim.lock.release(); }
     return ok(`Worker "${input.workerId}" was stopped and its artifacts deleted.`);
   }
   const after = await resolveWorker(input.workerId);
@@ -716,7 +741,7 @@ export async function workerRespond(
         'decision: "allow" or decision: "deny" (text is kept as the reason).',
     );
   }
-  if (pending?.kind === "question" && input.decision === "allow" && input.text === undefined) {
+  if (pending?.kind === "question" && input.decision !== "deny" && input.text === undefined && input.answers === undefined) {
     return fail(`"${input.requestId}" is a question. Answer it with decision: "answer" and the text.`);
   }
   const response = await callSupervisor(found.record, {
@@ -725,6 +750,7 @@ export async function workerRespond(
     decision: {
       decision: input.decision,
       ...(input.text !== undefined ? { text: input.text } : {}),
+      ...(input.answers !== undefined ? { answers: input.answers } : {}),
     },
     owner: owner(ctx),
     ...(input.takeover === true ? { takeover: true } : {}),
@@ -752,7 +778,10 @@ export async function workerResume(
   const record = found.record;
 
   // A live supervisor only needs un-sticking.
-  if (found.alive && !isTerminalState(record.state)) {
+  if (record.owner.clientId !== ctx.clientId && input.takeover !== true) {
+    return fail(`not_owner: worker "${input.workerId}" is controlled by ${record.owner.host} (client ${record.owner.clientId}). Use takeover: true to take control explicitly.`);
+  }
+  if (found.alive) {
     const response = await callSupervisor(record, {
       op: "resume",
       ...(input.task !== undefined ? { task: input.task } : {}),
@@ -789,6 +818,7 @@ export async function workerResume(
     resumeSessionId: record.sessionId,
     owner: owner(ctx),
     // An empty task means "reattach only" - the supervisor starts no turn.
+    expectedOwnerClientId: record.owner.clientId,
     task: input.task ?? "",
   };
 
