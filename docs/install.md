@@ -85,34 +85,42 @@ git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
 sh ~/src/agent-workers/scripts/install-codex.sh
 ```
 
-Or by hand — **both** lines matter:
+It decides whether you are already registered by reading
+`[mcp_servers.agent-workers]` out of `~/.codex/config.toml`, not by reading
+`codex mcp list` — that listing merges plugin-declared servers with registered
+ones, so after step 1 it shows an `agent-workers` row for a server that does not
+exist yet. If a step does not take, the installer says so and exits non-zero
+rather than reporting a success it did not achieve.
+
+Or by hand:
 
 ```bash
 codex mcp add agent-workers -- node ~/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs
 ```
 
-then add one line to the block it wrote in `~/.codex/config.toml`:
+which writes:
 
 ```toml
 [mcp_servers.agent-workers]
-default_tools_approval_mode = "approve"       # <- add this
 command = "node"
 args = ["/home/you/src/agent-workers/plugins/agent-workers/dist/agent-workers.mjs"]
 ```
 
-Without it, Codex refuses every `worker_*` call in any session whose approval
-policy is `never` — which is what `codex exec` and most automation use — with
-*"MCP tool call requires approval, but approval policy is never"*. The tools it
-pre-approves start and steer workers; they do not themselves touch your files,
-and each worker's own sandbox and permission mode still apply. Remove the line if
-you would rather approve each call by hand in an interactive session.
+That is the whole registration. If you also want the `worker_*` tools to work in
+`codex exec` and other non-interactive sessions, see
+[Pre-approving the worker tools](#pre-approving-the-worker-tools---approve-tools)
+below — it is a separate, deliberate step.
 
 Then verify:
 
 ```bash
 codex plugin list | grep agent-workers
-codex mcp list | grep agent-workers        # status should be "enabled"
+grep -A2 '^\[mcp_servers.agent-workers\]' ~/.codex/config.toml
 ```
+
+`codex mcp list` is the wrong check on 0.153.4: it shows an `agent-workers` row
+once the plugin is installed, whether or not a server is registered. The config
+file is where a registration actually lives.
 
 The definitive check is that a Codex turn can call a tool:
 
@@ -126,6 +134,57 @@ twice.
 
 ---
 
+## Pre-approving the worker tools (`--approve-tools`)
+
+Codex asks for approval before every MCP tool call, and a session running with
+approval policy `never` — which is what `codex exec` and most automation use —
+refuses them outright rather than prompting:
+
+> MCP tool call requires approval, but approval policy is never
+
+One line fixes that for this server:
+
+```toml
+[mcp_servers.agent-workers]
+default_tools_approval_mode = "approve"
+```
+
+The installer does **not** add it for you. Ask for it explicitly:
+
+```bash
+sh ~/src/agent-workers/scripts/install-codex.sh --approve-tools
+```
+
+It is opt-in because it is a real grant, and worth reading before you make it.
+`default_tools_approval_mode = "approve"` means Codex stops asking about the
+`worker_*` tools of the `agent-workers` server. Those tools do write:
+
+- `worker_start` creates a git worktree under `.worktrees/` in whichever
+  repository you point it at, and appends an entry to that repository's
+  `.git/info/exclude`.
+- `worker_start` can launch a worker that edits files — with `writeAccess: true`
+  in its own worktree, or in your checkout if you also pass
+  `allowMainCheckout: true`.
+- `worker_stop(purge=true)` deletes that worker's state directory and artifacts
+  under `~/.agent-workers/`.
+
+What it does **not** do:
+
+- it does not touch any other MCP server — the key goes in the
+  `[mcp_servers.agent-workers]` block only, never in a global policy;
+- it does not change the approval policy of your Codex session itself, nor of
+  anything Codex runs directly;
+- it does not change what a worker may do. Each worker's own sandbox, permission
+  mode and `writeAccess` still apply, and a write worker without isolation is
+  still refused.
+
+A value you already chose is never overwritten: if the block says
+`default_tools_approval_mode = "prompt"`, `--approve-tools` reports it and
+leaves it. To undo the grant, delete the line. Without it, everything still
+works in an interactive session where you can answer the prompts.
+
+---
+
 ## Do not register the same server twice
 
 Each host must end up with exactly one `agent-workers` MCP server. Two entries
@@ -136,8 +195,10 @@ upgrade that starts launching plugin MCP servers.
 Two bridges are not actually dangerous here — workers live in their own
 supervisor processes and every file has a single writer, so a duplicate bridge
 duplicates nothing but the process itself. It is still waste and confusing
-tool lists, so check with `/mcp` (Claude) or `codex mcp list` (Codex) after
-installing, and remove whichever registration you did not intend.
+tool lists, so after installing check `/mcp` (Claude) or
+`~/.codex/config.toml` (Codex — one `[mcp_servers.agent-workers]` block, and a
+second `agent-workers` row in `codex mcp list` is the plugin, not a duplicate
+registration), and remove whichever registration you did not intend.
 
 ---
 

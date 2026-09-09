@@ -93,7 +93,14 @@ git clone https://github.com/todorkolev/agent-workers.git ~/src/agent-workers
 sh ~/src/agent-workers/scripts/install-codex.sh          # the MCP server itself
 ```
 
-Register the MCP server exactly **once** per host.
+Register the MCP server exactly **once** per host. `codex mcp list` shows an
+`agent-workers` row as soon as the plugin is installed, so the installer reads
+`~/.codex/config.toml` instead to decide whether a server is really registered.
+
+For `codex exec` and other sessions whose approval policy is `never`, Codex
+refuses MCP tool calls unless the server pre-approves them. That is an opt-in:
+add `--approve-tools` to the installer, after reading what it grants in
+[docs/install.md](docs/install.md#pre-approving-the-worker-tools---approve-tools).
 
 Requirements: Node 20+, and whichever provider CLIs you intend to use
 (`claude` and/or `codex`), logged in the normal way. Nothing here asks for an API
