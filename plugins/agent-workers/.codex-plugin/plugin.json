@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "agent-workers",
+  "version": "0.1.0",
+  "description": "Persistent, interactive Claude and Codex workers, driven through one MCP tool contract.",
+  "author": { "name": "Todor Kolev" },
+  "homepage": "https://github.com/todorkolev/agentic-workers",
+  "repository": "https://github.com/todorkolev/agentic-workers",
+  "license": "MIT",
+  "keywords": ["agents", "workers", "codex", "claude", "delegation", "mcp"]
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "agent-workers": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${PLUGIN_ROOT}/dist/agent-workers.mjs"],
+      "env": {
+        "AGENT_WORKERS_SUPERVISOR": "${PLUGIN_ROOT}/dist/supervisor.mjs"
+      }
+    }
+  }
+}
