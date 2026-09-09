@@ -186,8 +186,27 @@ async function scenarioSteer() {
   check("guidance changed the worker's course mid-task", steered.hit, steered.all.slice(-500));
 
   say("starting another long turn, then interrupting it");
-  await call("worker_send", { workerId, text: "Now run: sleep 45; echo DONE-LATE. Then report the output." });
-  await new Promise((r) => setTimeout(r, 12000));
+  // One bare command, run in the foreground. A chained `sleep N; echo ...` is
+  // refused by the worker's own shell guardrail, and the worker then reasonably
+  // backgrounds it and finishes the turn - so by the time we interrupted there
+  // was genuinely nothing running, and the refusal was correct rather than a
+  // regression. Interrupt has to be tested against a turn that is really live.
+  await call("worker_send", {
+    workerId,
+    text: "Run exactly this single Bash command in the foreground and nothing else: sleep 45. Do not background it. Then report that it finished.",
+  });
+
+  // Confirm the worker is actually running before interrupting; otherwise a
+  // fast-finishing turn makes this look like a product failure.
+  let midTurn = false;
+  for (let i = 0; i < 30; i += 1) {
+    const st = await call("worker_status", { workerId });
+    if (/state running/.test(st.text)) { midTurn = true; break; }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  check("the worker is genuinely mid-turn before we interrupt it", midTurn,
+    "the turn finished before the interrupt, so this scenario proved nothing");
+
   const interrupted = await call("worker_interrupt", { workerId });
   check("worker_interrupt succeeded", !interrupted.isError, interrupted.text.slice(0, 200));
 
