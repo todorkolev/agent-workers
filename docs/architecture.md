@@ -1,5 +1,13 @@
 # Architecture
 
+The optional bundled `worker-watch.mjs` is a read-only CLI using the bridge's
+wait logic against the existing supervisor journal. It holds one absolute
+deadline, scans routine events internally, and returns a bounded attention
+report without acknowledging the transcript. Manager-supplied JavaScript
+regexes match normalized event text; lifecycle, decision and error signals
+remain enabled. It adds no worker-directory writes or daemon. The host owns
+background completion/long waiting; project wrappers retain lease renewal.
+
 ## The problem this shape solves
 
 A worker has to outlive the tool call that created it, survive its manager

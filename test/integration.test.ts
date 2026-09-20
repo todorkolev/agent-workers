@@ -160,6 +160,31 @@ describe("tool surface", () => {
 
 for (const provider of ["claude", "codex"] as const) {
   describe(`${provider} worker`, () => {
+    it("shares custom attention rules between the MCP wait and standalone watcher", async () => {
+      const started = await bridge.call("worker_start", { provider, cwd: projectDir,
+        task: "READY_314 milestone", waitFor: "idle" });
+      assert.equal(started.isError, false, started.text);
+      const workerId = idOf(started.text);
+      const waited = await bridge.call("worker_wait", { workerId, cursor: 0,
+        wakeRegex: ["never-this", "READY_\\d+"], wakeRegexFlags: "m", timeoutMs: 1000 });
+      assert.equal(waited.isError, false, waited.text);
+      assert.match(waited.text, /matched wakeRegex\[1\]/);
+      const watched = JSON.parse(execFileSync(process.execPath, [
+        path.join(root, "plugins/agent-workers/dist/worker-watch.mjs"),
+        "--worker", workerId, "--cursor", "0", "--deadline", new Date(Date.now() + 1000).toISOString(),
+        "--wake-regex", "READY_\\d+",
+      ], { env: { ...process.env, AGENT_WORKERS_HOME: stateHome }, encoding: "utf8" }));
+      assert.equal(watched.reason, "event");
+      assert.equal(watched.matchedRegex, 0);
+      assert.equal(watched.readFromCursor, 0);
+      const invalid = await bridge.call("worker_wait", { workerId, wakeRegex: ["["] });
+      assert.equal(invalid.isError, true);
+      assert.match(invalid.text, /Invalid wake regex/);
+      // Observation did not consume the original message.
+      assert.match((await bridge.call("worker_read", { workerId, cursor: 0 })).text, /READY_314/);
+      await bridge.call("worker_stop", { workerId });
+    });
+
     it("keeps its context across several turns", async () => {
       const started = await bridge.call("worker_start", {
         provider,

@@ -18,6 +18,7 @@ import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
 import { controlRequest } from "../core/control.ts";
 import { createLogger } from "../core/logger.ts";
 import {
@@ -213,25 +214,81 @@ export async function waitForWorker(
     states?: readonly string[];
     /** Only count events a manager would actually want to read. */
     messagesOnly?: boolean;
+    /** Ignore routine narration; wake for decisions, errors or turn completion. */
+    attentionOnly?: boolean;
+    /** Manager-defined expressions against each normalized event's text. */
+    wakeRegex?: readonly RegExp[];
+    expectedSupervisorPid?: number;
+    expectedTurnId?: string;
+    signal?: AbortSignal;
+    pollMs?: number;
   },
-): Promise<{ worker: ResolvedWorker | undefined; reason: "event" | "state" | "timeout" | "gone" }> {
+): Promise<{
+  worker: ResolvedWorker | undefined;
+  reason: "event" | "state" | "timeout" | "gone" | "changed";
+  event?: WorkerEvent;
+  lastEvent?: WorkerEvent;
+  matchedRegex?: number;
+}> {
   const deadline = Date.now() + opts.timeoutMs;
   const states = new Set(opts.states ?? []);
+  // This is a private scan position, NOT an acknowledgement of delivered output.
+  // Advancing it also prevents 200 routine events from hiding a later question.
+  let scanCursor = opts.sinceSeq;
+  let lastEvent: WorkerEvent | undefined;
+  let previousRecordSeq = 0;
   for (;;) {
+    opts.signal?.throwIfAborted();
     const worker = await resolveWorker(workerId);
     if (worker === undefined) return { worker: undefined, reason: "gone" };
-    if (opts.sinceSeq !== undefined && worker.record.lastSeq > opts.sinceSeq) {
+    if ((opts.expectedSupervisorPid !== undefined && worker.record.supervisorPid !== opts.expectedSupervisorPid) ||
+        (opts.expectedTurnId !== undefined && worker.record.turnId !== undefined && worker.record.turnId !== opts.expectedTurnId) ||
+        worker.record.lastSeq < previousRecordSeq) {
+      return { worker, reason: "changed", lastEvent };
+    }
+    previousRecordSeq = worker.record.lastSeq;
+    let more = false;
+    if (scanCursor !== undefined && worker.record.lastSeq > scanCursor) {
       // "The worker said something" must not be satisfied by a lifecycle status
       // event - `turn started` is not a message anyone wants to read.
-      if (opts.messagesOnly !== true) return { worker, reason: "event" };
-      const { entries } = await readSince<WorkerEvent>(worker.record.paths.journal, opts.sinceSeq, 200);
-      if (entries.some((e) => HIGH_SIGNAL_EVENTS.includes(e.type))) return { worker, reason: "event" };
+      if (!opts.messagesOnly && !opts.attentionOnly) return { worker, reason: "event" };
+      const page = await readSince<WorkerEvent>(worker.record.paths.journal, scanCursor, 500, opts.attentionOnly);
+      let matchedRegex: number | undefined;
+      const event = page.entries.find((e) => {
+        const index = opts.wakeRegex?.findIndex((regex) => {
+          // Global/sticky expressions must not retain state between events.
+          regex.lastIndex = 0;
+          return regex.test(e.text ?? "");
+        }) ?? -1;
+        if (index >= 0) { matchedRegex = index; return true; }
+        return opts.attentionOnly ? needsAttention(e) : HIGH_SIGNAL_EVENTS.includes(e.type);
+      });
+      lastEvent = page.entries.at(-1) ?? lastEvent;
+      if (event) return { worker, reason: "event", event, lastEvent, matchedRegex };
+      scanCursor = lastEvent?.seq ?? scanCursor;
+      more = page.more;
     }
-    if (states.size > 0 && states.has(worker.record.state)) return { worker, reason: "state" };
-    if (!worker.alive && !isLiveState(worker.record.state)) return { worker, reason: "state" };
-    if (Date.now() >= deadline) return { worker, reason: "timeout" };
-    await delay(Math.min(250, Math.max(50, deadline - Date.now())));
+    if ((states.size > 0 && states.has(worker.record.state)) || (opts.attentionOnly && worker.record.pending.length > 0)) {
+      return { worker, reason: "state", lastEvent };
+    }
+    if (!worker.alive && !isLiveState(worker.record.state)) return { worker, reason: "state", lastEvent };
+    if (Date.now() >= deadline) return { worker, reason: "timeout", lastEvent };
+    if (more) continue;
+    // A referenced timer keeps the standalone watcher alive too. No model or
+    // MCP request is involved in these filesystem checks.
+    await sleep(Math.min(opts.pollMs ?? 250, Math.max(1, deadline - Date.now())), undefined, { signal: opts.signal });
   }
+}
+
+export function needsAttention(event: WorkerEvent): boolean {
+  return ["final", "question", "permission_request", "permission_denied", "error", "turn_completed"].includes(event.type);
+}
+
+export function compileWakeRegex(patterns: readonly string[] = [], flags = "m"): RegExp[] {
+  return patterns.map((pattern, index) => {
+    try { return new RegExp(pattern, flags); }
+    catch (error) { throw new Error(`Invalid wake regex #${index}: ${String(error)}`); }
+  });
 }
 
 function delay(ms: number): Promise<void> {

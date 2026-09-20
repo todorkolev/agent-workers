@@ -149,7 +149,7 @@ async function main(): Promise<void> {
   register(
     "worker_read",
     "Read what a worker has produced since a cursor. Returns only new events, bounded in size, with the " +
-      "next cursor and whether more is waiting. Cheap to call repeatedly - it never replays what you read.",
+      "next cursor and whether more is waiting. Use the bundled worker-watch.mjs for unattended waiting; do not poll from the model.",
     readSchema,
     workerRead,
     { readOnlyHint: true },
@@ -158,7 +158,8 @@ async function main(): Promise<void> {
   register(
     "worker_wait",
     "Block until a worker produces something new, asks a question, changes state, or the timeout expires. " +
-      "Does not return the output itself - follow it with worker_read from the same cursor.",
+      "Use until='attention' to ignore routine progress. For long unattended waits use the bundled worker-watch.mjs " +
+      "outside MCP request timeouts. Does not acknowledge output - follow it with worker_read from the same cursor.",
     waitSchema,
     workerWait,
     { readOnlyHint: true },

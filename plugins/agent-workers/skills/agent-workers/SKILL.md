@@ -26,8 +26,27 @@ worker_result  -> final answer, changed files, commit, diff, artifact paths
 worker_stop    -> end it for good
 ```
 
-Read with a cursor and pass the returned cursor back. Reads never replay what
-you have already seen, so polling is cheap.
+Read with a cursor and pass the returned cursor back. Keep waiting inside a
+deterministic process; repeated model turns to poll still consume tokens.
+
+## Waiting without model polling
+
+Use the bundled `dist/worker-watch.mjs` for unattended work. It runs beside the
+supervisor with the same `AGENT_WORKERS_HOME`, silently checks the existing
+journal, and returns one short JSON report on attention or an absolute deadline.
+It needs no new daemon, provider session or dependency install.
+
+The manager may supply **its own regular expressions** and tell the worker what
+vocabulary to use for questions, blockers and meaningful milestones. There is
+no built-in keyword dictionary. Custom matches supplement decision, error and
+completion signals. Ordinary narration does not wake the model by default.
+
+Read [references/waiting.md](references/waiting.md) for the invocation, regex
+contract and host wait lifecycle. Retain project-specific lease renewal around
+the process; do not reimplement observation in every project. Set the outer
+host wait to reach the same meaningful deadline, rather than waking the model
+every minute. Collect results only when the worker is ready, and never interpret
+a watcher exit or regex match as a successful task or a passed review.
 
 ## Starting one
 

@@ -21555,13 +21555,14 @@ async function readJson(file) {
     return void 0;
   }
 }
-async function readSince(file, sinceSeq, maxEntries) {
+async function readSince(file, sinceSeq, maxEntries, strict = false) {
   const entries = [];
   let more = false;
   let stream;
   try {
     stream = fs.createReadStream(file, { encoding: "utf8" });
-  } catch {
+  } catch (error2) {
+    if (strict) throw error2;
     return { entries, more };
   }
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -21581,7 +21582,8 @@ async function readSince(file, sinceSeq, maxEntries) {
       }
       entries.push(parsed);
     }
-  } catch {
+  } catch (error2) {
+    if (strict) throw error2;
   } finally {
     rl.close();
     stream.destroy();
@@ -22000,6 +22002,7 @@ import * as fs3 from "node:fs";
 import * as os2 from "node:os";
 import * as path4 from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
 
 // src/core/control.ts
 import * as net from "node:net";
@@ -22130,19 +22133,58 @@ async function waitForSupervisor(workerId, timeoutMs, expectedPid) {
 async function waitForWorker(workerId, opts) {
   const deadline = Date.now() + opts.timeoutMs;
   const states = new Set(opts.states ?? []);
+  let scanCursor = opts.sinceSeq;
+  let lastEvent;
+  let previousRecordSeq = 0;
   for (; ; ) {
+    opts.signal?.throwIfAborted();
     const worker = await resolveWorker(workerId);
     if (worker === void 0) return { worker: void 0, reason: "gone" };
-    if (opts.sinceSeq !== void 0 && worker.record.lastSeq > opts.sinceSeq) {
-      if (opts.messagesOnly !== true) return { worker, reason: "event" };
-      const { entries } = await readSince(worker.record.paths.journal, opts.sinceSeq, 200);
-      if (entries.some((e) => HIGH_SIGNAL_EVENTS.includes(e.type))) return { worker, reason: "event" };
+    if (opts.expectedSupervisorPid !== void 0 && worker.record.supervisorPid !== opts.expectedSupervisorPid || opts.expectedTurnId !== void 0 && worker.record.turnId !== void 0 && worker.record.turnId !== opts.expectedTurnId || worker.record.lastSeq < previousRecordSeq) {
+      return { worker, reason: "changed", lastEvent };
     }
-    if (states.size > 0 && states.has(worker.record.state)) return { worker, reason: "state" };
-    if (!worker.alive && !isLiveState(worker.record.state)) return { worker, reason: "state" };
-    if (Date.now() >= deadline) return { worker, reason: "timeout" };
-    await delay(Math.min(250, Math.max(50, deadline - Date.now())));
+    previousRecordSeq = worker.record.lastSeq;
+    let more = false;
+    if (scanCursor !== void 0 && worker.record.lastSeq > scanCursor) {
+      if (!opts.messagesOnly && !opts.attentionOnly) return { worker, reason: "event" };
+      const page = await readSince(worker.record.paths.journal, scanCursor, 500, opts.attentionOnly);
+      let matchedRegex;
+      const event = page.entries.find((e) => {
+        const index = opts.wakeRegex?.findIndex((regex) => {
+          regex.lastIndex = 0;
+          return regex.test(e.text ?? "");
+        }) ?? -1;
+        if (index >= 0) {
+          matchedRegex = index;
+          return true;
+        }
+        return opts.attentionOnly ? needsAttention(e) : HIGH_SIGNAL_EVENTS.includes(e.type);
+      });
+      lastEvent = page.entries.at(-1) ?? lastEvent;
+      if (event) return { worker, reason: "event", event, lastEvent, matchedRegex };
+      scanCursor = lastEvent?.seq ?? scanCursor;
+      more = page.more;
+    }
+    if (states.size > 0 && states.has(worker.record.state) || opts.attentionOnly && worker.record.pending.length > 0) {
+      return { worker, reason: "state", lastEvent };
+    }
+    if (!worker.alive && !isLiveState(worker.record.state)) return { worker, reason: "state", lastEvent };
+    if (Date.now() >= deadline) return { worker, reason: "timeout", lastEvent };
+    if (more) continue;
+    await sleep(Math.min(opts.pollMs ?? 250, Math.max(1, deadline - Date.now())), void 0, { signal: opts.signal });
   }
+}
+function needsAttention(event) {
+  return ["final", "question", "permission_request", "permission_denied", "error", "turn_completed"].includes(event.type);
+}
+function compileWakeRegex(patterns = [], flags = "m") {
+  return patterns.map((pattern, index) => {
+    try {
+      return new RegExp(pattern, flags);
+    } catch (error2) {
+      throw new Error(`Invalid wake regex #${index}: ${String(error2)}`);
+    }
+  });
 }
 function delay(ms) {
   return new Promise((resolve7) => {
@@ -22344,9 +22386,11 @@ var waitSchema = {
   workerId: safeWorkerIdSchema,
   cursor: external_exports.number().int().min(0).optional().describe("Wait for an event after this sequence number."),
   timeoutMs: external_exports.number().int().min(1e3).max(24e4).optional().describe(
-    "How long to block, default 45000. Kept under a minute by default because a host's own MCP request timeout (often 60s) applies to this call - a longer wait surfaces as a protocol timeout, not as a result. Just call it again to keep waiting."
+    "How long to block, default 45000. Kept under a minute by default because a host's own MCP request timeout (often 60s) applies to this call - a longer wait surfaces as a protocol timeout, not as a result. For unattended waits use the bundled worker-watch.mjs CLI."
   ),
-  until: external_exports.enum(["message", "idle", "blocked", "end"]).optional().describe("What to wait for. Default 'message': any new event, question or state change.")
+  until: external_exports.enum(["message", "attention", "idle", "blocked", "end"]).optional().describe("Default 'message': new messages. 'attention': decisions, errors, turn completion or a wakeRegex match; ignore routine progress."),
+  wakeRegex: external_exports.array(external_exports.string()).optional().describe("For until='attention': JavaScript regex sources, ORed against normalized event text. No fixed marker vocabulary. Setting these defaults until to 'attention'."),
+  wakeRegexFlags: external_exports.string().optional().describe("Flags shared by wakeRegex expressions; default 'm'. Invalid expressions fail before waiting.")
 };
 var sendSchema = {
   workerId: safeWorkerIdSchema,
@@ -22625,19 +22669,29 @@ async function workerWait(_ctx, input) {
   const found = await needWorker(input.workerId);
   if (isToolOutput(found)) return found;
   const timeoutMs = input.timeoutMs ?? 45e3;
-  const until = input.until ?? "message";
-  const states = until === "idle" ? ["idle", "blocked", "interrupted", "completed", "failed", "stopped", "orphaned"] : until === "end" ? ["completed", "failed", "stopped", "orphaned"] : ["blocked", "failed", "stopped", "orphaned"];
+  const until = input.until ?? (input.wakeRegex?.length ? "attention" : "message");
+  if (input.wakeRegex?.length && until !== "attention") return fail("wakeRegex requires until='attention'.");
+  let wakeRegex;
+  try {
+    wakeRegex = compileWakeRegex(input.wakeRegex, input.wakeRegexFlags);
+  } catch (error2) {
+    return fail(String(error2));
+  }
+  const states = until === "idle" || until === "attention" ? ["idle", "blocked", "interrupted", "completed", "failed", "stopped", "orphaned"] : until === "end" ? ["completed", "failed", "stopped", "orphaned"] : ["blocked", "failed", "stopped", "orphaned"];
   const outcome = await waitForWorker(input.workerId, {
     timeoutMs,
     ...until === "message" ? { sinceSeq: input.cursor ?? found.record.lastSeq, messagesOnly: true } : {},
-    states
+    ...until === "attention" ? { sinceSeq: input.cursor ?? found.record.lastSeq, attentionOnly: true } : {},
+    states,
+    wakeRegex
   });
   if (outcome.worker === void 0) return fail(`Worker "${input.workerId}" disappeared while waiting.`);
   const lines = [renderHeader(outcome.worker)];
   lines.push(
-    outcome.reason === "timeout" ? `nothing new within ${timeoutMs}ms - the worker is still going; call worker_wait again to keep waiting` : `woke on: ${outcome.reason}`
+    outcome.reason === "timeout" ? `nothing new within ${timeoutMs}ms - for unattended waiting use the bundled worker-watch.mjs CLI` : `woke on: ${outcome.reason}`
   );
   lines.push("");
+  if (outcome.matchedRegex !== void 0) lines.push(`matched wakeRegex[${outcome.matchedRegex}] at event ${outcome.event?.seq}`);
   lines.push(renderHint(outcome.worker.record));
   if (outcome.reason === "event") {
     lines.push(
@@ -22917,7 +22971,7 @@ function deriveClientId(host, projectDir) {
 }
 
 // src/bridge/main.ts
-var VERSION = true ? "0.1.1" : "0.0.0-dev";
+var VERSION = true ? "0.2.0" : "0.0.0-dev";
 var log2 = createLogger("bridge");
 function detectHost() {
   if (process.env["CLAUDE_PLUGIN_ROOT"] || process.env["CLAUDE_PROJECT_DIR"] || process.env["CLAUDECODE"]) {
@@ -22982,14 +23036,14 @@ async function main() {
   );
   register(
     "worker_read",
-    "Read what a worker has produced since a cursor. Returns only new events, bounded in size, with the next cursor and whether more is waiting. Cheap to call repeatedly - it never replays what you read.",
+    "Read what a worker has produced since a cursor. Returns only new events, bounded in size, with the next cursor and whether more is waiting. Use the bundled worker-watch.mjs for unattended waiting; do not poll from the model.",
     readSchema,
     workerRead,
     { readOnlyHint: true }
   );
   register(
     "worker_wait",
-    "Block until a worker produces something new, asks a question, changes state, or the timeout expires. Does not return the output itself - follow it with worker_read from the same cursor.",
+    "Block until a worker produces something new, asks a question, changes state, or the timeout expires. Use until='attention' to ignore routine progress. For long unattended waits use the bundled worker-watch.mjs outside MCP request timeouts. Does not acknowledge output - follow it with worker_read from the same cursor.",
     waitSchema,
     workerWait,
     { readOnlyHint: true }

@@ -24,7 +24,7 @@ All four combinations work, and behave the same at the tool layer:
 ```
 worker_start      a durable workerId, immediately; the worker keeps going
 worker_read       only what is new since your cursor, size-bounded
-worker_wait       block until there is something new
+worker_wait       short waits for messages or attention
 worker_send       guidance, mid-task or between turns
 worker_respond    answer a question or a permission request
 worker_interrupt  cut the current turn short, keep the session
@@ -35,6 +35,14 @@ worker_status     including whether the process is genuinely alive
 worker_stop       end it for good
 worker_trace      the unfiltered journal, when something looks wrong
 ```
+
+For unattended work, use the bundled `dist/worker-watch.mjs`: one process waits
+silently for a decision, error, completion, manager-defined regex match or an
+absolute deadline. Routine progress stays out of the manager's context. The
+manager chooses any milestone vocabulary and gives it to the worker; the
+plugin does not prescribe keywords. See the
+[waiting guide](plugins/agent-workers/skills/agent-workers/references/waiting.md)
+for regexes, cursor handling and host background completion.
 
 ```
 > worker_start(provider="codex", model="gpt-5.6-sol", effort="max",

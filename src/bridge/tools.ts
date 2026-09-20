@@ -40,6 +40,7 @@ import {
 import type { SupervisorSpec } from "../supervisor/spec.ts";
 import {
   callSupervisor,
+  compileWakeRegex,
   findWriteConflict,
   listLiveWorkers,
   listWorkers,
@@ -150,12 +151,14 @@ export const waitSchema = {
     .describe(
       "How long to block, default 45000. Kept under a minute by default because a " +
         "host's own MCP request timeout (often 60s) applies to this call - a longer wait " +
-        "surfaces as a protocol timeout, not as a result. Just call it again to keep waiting.",
+        "surfaces as a protocol timeout, not as a result. For unattended waits use the bundled worker-watch.mjs CLI.",
     ),
   until: z
-    .enum(["message", "idle", "blocked", "end"])
+    .enum(["message", "attention", "idle", "blocked", "end"])
     .optional()
-    .describe("What to wait for. Default 'message': any new event, question or state change."),
+    .describe("Default 'message': new messages. 'attention': decisions, errors, turn completion or a wakeRegex match; ignore routine progress."),
+  wakeRegex: z.array(z.string()).optional().describe("For until='attention': JavaScript regex sources, ORed against normalized event text. No fixed marker vocabulary. Setting these defaults until to 'attention'."),
+  wakeRegexFlags: z.string().optional().describe("Flags shared by wakeRegex expressions; default 'm'. Invalid expressions fail before waiting."),
 };
 
 export const sendSchema = {
@@ -547,9 +550,13 @@ export async function workerWait(
   if (isToolOutput(found)) return found;
 
   const timeoutMs = input.timeoutMs ?? 45_000;
-  const until = input.until ?? "message";
+  const until = input.until ?? (input.wakeRegex?.length ? "attention" : "message");
+  if (input.wakeRegex?.length && until !== "attention") return fail("wakeRegex requires until='attention'.");
+  let wakeRegex: RegExp[];
+  try { wakeRegex = compileWakeRegex(input.wakeRegex, input.wakeRegexFlags); }
+  catch (error) { return fail(String(error)); }
   const states =
-    until === "idle"
+    until === "idle" || until === "attention"
       ? (["idle", "blocked", "interrupted", "completed", "failed", "stopped", "orphaned"] as const)
       : until === "end"
         ? (["completed", "failed", "stopped", "orphaned"] as const)
@@ -558,7 +565,9 @@ export async function workerWait(
   const outcome = await waitForWorker(input.workerId, {
     timeoutMs,
     ...(until === "message" ? { sinceSeq: input.cursor ?? found.record.lastSeq, messagesOnly: true } : {}),
+    ...(until === "attention" ? { sinceSeq: input.cursor ?? found.record.lastSeq, attentionOnly: true } : {}),
     states,
+    wakeRegex,
   });
 
   if (outcome.worker === undefined) return fail(`Worker "${input.workerId}" disappeared while waiting.`);
@@ -566,10 +575,11 @@ export async function workerWait(
   const lines = [renderHeader(outcome.worker)];
   lines.push(
     outcome.reason === "timeout"
-      ? `nothing new within ${timeoutMs}ms - the worker is still going; call worker_wait again to keep waiting`
+      ? `nothing new within ${timeoutMs}ms - for unattended waiting use the bundled worker-watch.mjs CLI`
       : `woke on: ${outcome.reason}`,
   );
   lines.push("");
+  if (outcome.matchedRegex !== undefined) lines.push(`matched wakeRegex[${outcome.matchedRegex}] at event ${outcome.event?.seq}`);
   lines.push(renderHint(outcome.worker.record));
   if (outcome.reason === "event") {
     lines.push(

@@ -1,5 +1,5 @@
 /**
- * Bundle the bridge and the supervisor into two committed ESM files.
+ * Bundle the bridge, supervisor and unattended watcher into committed ESM files.
  *
  * They are committed because a plugin is installed by cloning the repository:
  * an install must not require a toolchain, a network fetch, or an npm install
@@ -40,6 +40,12 @@ await build({
   ...common,
   entryPoints: [path.join(root, "src/supervisor/main.ts")],
   outfile: path.join(outDir, "supervisor.mjs"),
+});
+
+await build({
+  ...common,
+  entryPoints: [path.join(root, "src/bridge/watch.ts")],
+  outfile: path.join(outDir, "worker-watch.mjs"),
 });
 
 process.stderr.write(`built agent-workers ${version} into ${path.relative(root, outDir)}\n`);

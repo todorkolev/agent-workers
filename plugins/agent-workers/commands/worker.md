@@ -14,8 +14,10 @@ Follow the `agent-workers` skill. In short:
 2. Otherwise call `worker_start` with an explicit `cwd`, the provider that was
    asked for (default `codex` for review or a second opinion, `claude` for
    implementation), and `worktree: true` whenever `writeAccess` is true.
-3. Then drive the loop: `worker_wait` -> `worker_read` -> `worker_send` /
-   `worker_respond`, and finish with `worker_result`.
+3. For unattended work, use the skill's bundled watcher with a meaningful
+   deadline and any manager-defined wake regexes. Keep observation and lease
+   renewal inside the process; do not poll from the model. On attention, read
+   the delta, guide/respond as needed, and collect `worker_result` when ready.
 4. Report back what the worker actually said and did, including the model it
    really used and the paths of anything it changed. Do not paste raw traces;
    point at the artifact paths instead.

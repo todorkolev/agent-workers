@@ -150,13 +150,14 @@ function appendText(file, text) {
   } catch {
   }
 }
-async function readSince(file, sinceSeq, maxEntries) {
+async function readSince(file, sinceSeq, maxEntries, strict = false) {
   const entries = [];
   let more = false;
   let stream;
   try {
     stream = fs.createReadStream(file, { encoding: "utf8" });
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return { entries, more };
   }
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -176,7 +177,8 @@ async function readSince(file, sinceSeq, maxEntries) {
       }
       entries.push(parsed);
     }
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
   } finally {
     rl.close();
     stream.destroy();

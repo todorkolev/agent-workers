@@ -190,13 +190,15 @@ export async function readSince<T extends { seq: number }>(
   file: string,
   sinceSeq: number,
   maxEntries: number,
+  strict = false,
 ): Promise<{ entries: T[]; more: boolean }> {
   const entries: T[] = [];
   let more = false;
   let stream: fs.ReadStream;
   try {
     stream = fs.createReadStream(file, { encoding: "utf8" });
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     return { entries, more };
   }
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -216,7 +218,8 @@ export async function readSince<T extends { seq: number }>(
       }
       entries.push(parsed);
     }
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     /* file vanished mid-read; return what we have */
   } finally {
     rl.close();
